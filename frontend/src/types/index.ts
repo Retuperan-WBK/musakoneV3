@@ -112,6 +112,7 @@ export interface Playlist {
     user_id: number;
     name: string;
     description: string | null;
+    is_public: boolean;
     created_at: number;
     updated_at: number;
 }

@@ -1524,6 +1524,7 @@ pub type Playlist {
     description: Option(String),
     created_at: Int,
     updated_at: Int,
+    is_public: Bool,
   )
 }
 
@@ -1538,7 +1539,16 @@ fn playlist_decoder() -> decode.Decoder(Playlist) {
   use description <- decode.field(3, decode.optional(decode.string))
   use created_at <- decode.field(4, decode.int)
   use updated_at <- decode.field(5, decode.int)
-  decode.success(Playlist(id:, user_id:, name:, description:, created_at:, updated_at:))
+  use is_public_int <- decode.field(6, decode.int)
+  decode.success(Playlist(
+    id:,
+    user_id:,
+    name:,
+    description:,
+    created_at:,
+    updated_at:,
+    is_public: is_public_int == 1,
+  ))
 }
 
 fn playlist_track_decoder() -> decode.Decoder(PlaylistTrack) {
@@ -1554,12 +1564,13 @@ pub fn create_playlist(
   user_id: Int,
   name: String,
   description: Option(String),
+  is_public: Bool,
   now_ms: Int,
 ) -> Result(List(Playlist), sqlight.Error) {
   let sql =
-    "INSERT INTO playlists (user_id, name, description, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?)
-     RETURNING id, user_id, name, description, created_at, updated_at"
+    "INSERT INTO playlists (user_id, name, description, is_public, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     RETURNING id, user_id, name, description, created_at, updated_at, is_public"
 
   sqlight.query(
     sql,
@@ -1568,6 +1579,10 @@ pub fn create_playlist(
       sqlight.int(user_id),
       sqlight.text(name),
       sqlight.nullable(sqlight.text, description),
+      sqlight.int(case is_public {
+        True -> 1
+        False -> 0
+      }),
       sqlight.int(now_ms),
       sqlight.int(now_ms),
     ],
@@ -1581,12 +1596,25 @@ pub fn get_user_playlists(
   user_id: Int,
 ) -> Result(List(Playlist), sqlight.Error) {
   let sql =
-    "SELECT id, user_id, name, description, created_at, updated_at
+    "SELECT id, user_id, name, description, created_at, updated_at, is_public
      FROM playlists
      WHERE user_id = ?
      ORDER BY updated_at DESC"
 
   sqlight.query(sql, db, [sqlight.int(user_id)], playlist_decoder())
+}
+
+/// Get all public playlists
+pub fn get_public_playlists(
+  db: sqlight.Connection,
+) -> Result(List(Playlist), sqlight.Error) {
+  let sql =
+    "SELECT id, user_id, name, description, created_at, updated_at, is_public
+     FROM playlists
+     WHERE is_public = 1
+     ORDER BY updated_at DESC"
+
+  sqlight.query(sql, db, [], playlist_decoder())
 }
 
 /// Get a single playlist by ID
@@ -1595,26 +1623,27 @@ pub fn get_playlist_by_id(
   playlist_id: Int,
 ) -> Result(List(Playlist), sqlight.Error) {
   let sql =
-    "SELECT id, user_id, name, description, created_at, updated_at
+    "SELECT id, user_id, name, description, created_at, updated_at, is_public
      FROM playlists
      WHERE id = ?"
 
   sqlight.query(sql, db, [sqlight.int(playlist_id)], playlist_decoder())
 }
 
-/// Update playlist name and description
+/// Update playlist name, description, and is_public
 pub fn update_playlist(
   db: sqlight.Connection,
   playlist_id: Int,
   name: String,
   description: Option(String),
+  is_public: Bool,
   now_ms: Int,
 ) -> Result(List(Playlist), sqlight.Error) {
   let sql =
     "UPDATE playlists
-     SET name = ?, description = ?, updated_at = ?
+     SET name = ?, description = ?, is_public = ?, updated_at = ?
      WHERE id = ?
-     RETURNING id, user_id, name, description, created_at, updated_at"
+     RETURNING id, user_id, name, description, created_at, updated_at, is_public"
 
   sqlight.query(
     sql,
@@ -1622,6 +1651,10 @@ pub fn update_playlist(
     [
       sqlight.text(name),
       sqlight.nullable(sqlight.text, description),
+      sqlight.int(case is_public {
+        True -> 1
+        False -> 0
+      }),
       sqlight.int(now_ms),
       sqlight.int(playlist_id),
     ],

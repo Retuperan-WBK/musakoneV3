@@ -418,6 +418,14 @@ fn handle_request(
       }
     }
 
+    http.Get, ["api", "playlists", "public"] -> {
+      case get_auth_header(req) {
+        Ok(auth_header) ->
+          http_handlers.list_public_playlists(state, auth_header) |> with_cors
+        Error(e) -> error_response(e, 401) |> with_cors
+      }
+    }
+
     http.Get, ["api", "playlists", id_str] -> {
       case int.parse(id_str) {
         Ok(playlist_id) -> {

@@ -728,6 +728,7 @@ fn encode_playlist(p: queries.Playlist) -> json.Json {
     #("user_id", json.int(p.user_id)),
     #("name", json.string(p.name)),
     #("description", json.nullable(p.description, json.string)),
+    #("is_public", json.bool(p.is_public)),
     #("created_at", json.int(p.created_at)),
     #("updated_at", json.int(p.updated_at)),
   ])
@@ -780,6 +781,35 @@ pub fn list_playlists(
               }
             }
             Error(e) -> error_response("Invalid token: " <> e, 401)
+          }
+        }
+        Error(e) ->
+          error_response(
+            "Invalid or expired token: " <> string.inspect(e),
+            401,
+          )
+      }
+    }
+    Error(e) -> error_response(e, 401)
+  }
+}
+
+/// List all public playlists from all users
+pub fn list_public_playlists(
+  state: AppState,
+  auth_header: String,
+) -> Response(ResponseData) {
+  case extract_token(auth_header) {
+    Ok(token) -> {
+      case verify_jwt_token(token, state.jwt_secret) {
+        Ok(_) -> {
+          case queries.get_public_playlists(state.db) {
+            Ok(playlists) -> {
+              json.array(playlists, encode_playlist)
+              |> json.to_string
+              |> respond_json(200)
+            }
+            Error(_) -> error_response("Database error", 500)
           }
         }
         Error(e) ->
@@ -847,13 +877,14 @@ pub fn create_playlist(
           case get_user_id_from_jwt(jwt_data) {
             Ok(user_id) -> {
               case parse_playlist_body(body) {
-                Ok(#(name, description)) -> {
+                Ok(#(name, description, is_public)) -> {
                   case
                     queries.create_playlist(
                       state.db,
                       user_id,
                       name,
                       description,
+                      is_public,
                       now_ms(),
                     )
                   {
@@ -881,7 +912,7 @@ pub fn create_playlist(
   }
 }
 
-/// Get a single playlist with its tracks
+/// Get a single playlist with its tracks (owner or public)
 pub fn get_playlist(
   state: AppState,
   auth_header: String,
@@ -893,19 +924,25 @@ pub fn get_playlist(
         Ok(jwt_data) -> {
           case get_user_id_from_jwt(jwt_data) {
             Ok(user_id) -> {
-              case verify_ownership(state.db, playlist_id, user_id) {
-                Ok(playlist) -> {
-                  let tracks =
-                    queries.get_playlist_tracks(state.db, playlist_id)
-                    |> result.unwrap([])
-                  json.object([
-                    #("playlist", encode_playlist(playlist)),
-                    #("tracks", json.array(tracks, encode_playlist_track)),
-                  ])
-                  |> json.to_string
-                  |> respond_json(200)
+              case queries.get_playlist_by_id(state.db, playlist_id) {
+                Ok([playlist, ..]) -> {
+                  case playlist.user_id == user_id || playlist.is_public {
+                    True -> {
+                      let tracks =
+                        queries.get_playlist_tracks(state.db, playlist_id)
+                        |> result.unwrap([])
+                      json.object([
+                        #("playlist", encode_playlist(playlist)),
+                        #("tracks", json.array(tracks, encode_playlist_track)),
+                      ])
+                      |> json.to_string
+                      |> respond_json(200)
+                    }
+                    False -> error_response("Forbidden", 403)
+                  }
                 }
-                Error(resp) -> resp
+                Ok([]) -> error_response("Playlist not found", 404)
+                Error(_) -> error_response("Database error", 500)
               }
             }
             Error(e) -> error_response("Invalid token: " <> e, 401)
@@ -938,13 +975,14 @@ pub fn update_playlist(
               case verify_ownership(state.db, playlist_id, user_id) {
                 Ok(_) -> {
                   case parse_playlist_body(body) {
-                    Ok(#(name, description)) -> {
+                    Ok(#(name, description, is_public)) -> {
                       case
                         queries.update_playlist(
                           state.db,
                           playlist_id,
                           name,
                           description,
+                          is_public,
                           now_ms(),
                         )
                       {
@@ -1050,35 +1088,23 @@ pub fn add_playlist_track(
                               now_ms(),
                             )
                           // Touch updated_at on the playlist
-                          let _ =
-                            queries.update_playlist(
+                          let _ = case
+                            queries.get_playlist_by_id(
                               state.db,
                               playlist_id,
-                              // Re-fetch to keep current name
-                              {
-                                case
-                                  queries.get_playlist_by_id(
-                                    state.db,
-                                    playlist_id,
-                                  )
-                                {
-                                  Ok([p, ..]) -> p.name
-                                  _ -> ""
-                                }
-                              },
-                              {
-                                case
-                                  queries.get_playlist_by_id(
-                                    state.db,
-                                    playlist_id,
-                                  )
-                                {
-                                  Ok([p, ..]) -> p.description
-                                  _ -> None
-                                }
-                              },
-                              now_ms(),
                             )
+                          {
+                            Ok([p, ..]) ->
+                              queries.update_playlist(
+                                state.db,
+                                playlist_id,
+                                p.name,
+                                p.description,
+                                p.is_public,
+                                now_ms(),
+                              )
+                            _ -> Ok([])
+                          }
                           json.object([#("ok", json.bool(True))])
                           |> json.to_string
                           |> respond_json(200)
@@ -1220,7 +1246,7 @@ pub fn reorder_playlist_track(
 
 fn parse_playlist_body(
   body: String,
-) -> Result(#(String, Option(String)), String) {
+) -> Result(#(String, Option(String), Bool), String) {
   let decoder = {
     use name <- decode.field("name", decode.string)
     use description <- decode.optional_field(
@@ -1228,11 +1254,14 @@ fn parse_playlist_body(
       None,
       decode.optional(decode.string),
     )
-    decode.success(#(name, description))
+    use is_public <- decode.optional_field("is_public", False, decode.bool)
+    decode.success(#(name, description, is_public))
   }
 
   json.parse(body, decoder)
-  |> result.map_error(fn(_) { "Invalid JSON: expected {name, description?}" })
+  |> result.map_error(fn(_) {
+    "Invalid JSON: expected {name, description?, is_public?}"
+  })
 }
 
 fn parse_track_uri_body(body: String) -> Result(String, String) {

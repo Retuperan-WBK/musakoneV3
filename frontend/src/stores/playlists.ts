@@ -3,6 +3,7 @@ import type { Playlist, PlaylistTrack } from '../types';
 
 // List view state
 export const playlists = atom<Playlist[]>([]);
+export const publicPlaylists = atom<Playlist[]>([]);
 export const playlistsLoading = atom(false);
 export const playlistsError = atom<string | null>(null);
 
@@ -16,6 +17,10 @@ export const addToPlaylistTrackUri = atom<string | null>(null);
 
 export function setPlaylists(data: Playlist[]): void {
     playlists.set(data);
+}
+
+export function setPublicPlaylists(data: Playlist[]): void {
+    publicPlaylists.set(data);
 }
 
 export function setPlaylistsLoading(loading: boolean): void {
