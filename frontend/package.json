@@ -11,6 +11,7 @@
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
     "type-check": "tsc --noEmit",
+    "icons": "./scripts/gen-icons.sh",
     "build-size": "terser dist/assets/*.js --compress --mangle --output dist/assets/"
   },
   "dependencies": {
