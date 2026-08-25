@@ -30,7 +30,13 @@ Gleam-based WebSocket server that acts as middleware between frontend clients an
 - `POST /api/auth/login` - User login (returns JWT token)
 - `GET /api/auth/me` - Get current user info (requires auth)
 - `GET /api/analytics/stats` - Get user statistics (requires auth)
-- `GET /api/analytics/history` - Get user action history (requires auth)
+- `GET /api/analytics/events|affinity|admin|export` - Activity, learned taste, room dashboard, raw export (requires auth)
+- `GET /api/playback/state` - Public now-playing snapshot; `GET /api/playback/history` - state timeline (requires auth)
+- `GET /api/recommendations?scope=me|room` - Tracks to play next (requires auth)
+- `GET|PUT /api/autoplay`, `POST /api/autoplay/fill` - Autoplay settings and manual refill (requires auth)
+- `GET /api/insights` - Everything behind the Mix → Stats page (requires auth)
+
+See `API.md` for payloads.
 
 ### WebSocket Endpoint
 

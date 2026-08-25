@@ -19,6 +19,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
 import gleam/string
 import gleam/time/timestamp
 import logging
@@ -223,8 +224,7 @@ fn handle_mopidy_event(
 
     event_bus.Connected -> {
       logging.log(logging.Info, "Playback state actor: Mopidy connected, querying initial state")
-      query_initial_state(state)
-      actor.continue(state)
+      actor.continue(query_initial_state(state))
     }
 
     event_bus.Disconnected -> {
@@ -236,27 +236,63 @@ fn handle_mopidy_event(
   }
 }
 
-/// Send initial state queries to Mopidy using reserved request IDs
-fn query_initial_state(state: State) -> Nil {
-  let queries = [
-    #(base_request_id, "core.playback.get_state"),
-    #(base_request_id + 1, "core.mixer.get_volume"),
-    #(base_request_id + 2, "core.playback.get_current_tl_track"),
-    #(base_request_id + 3, "core.playback.get_time_position"),
-    #(base_request_id + 4, "core.tracklist.get_tl_tracks"),
+/// Send initial state queries to Mopidy. Every request id is recorded in the
+/// context so the responses are correlated back into it (tracker.update_context
+/// ignores responses to requests it never saw).
+fn query_initial_state(state: State) -> State {
+  let methods = [
+    "core.playback.get_state",
+    "core.mixer.get_volume",
+    "core.playback.get_current_tl_track",
+    "core.playback.get_time_position",
+    "core.tracklist.get_tl_tracks",
   ]
 
-  list.each(queries, fn(q) {
-    let #(id, method) = q
-    let msg =
-      json.object([
-        #("jsonrpc", json.string("2.0")),
-        #("id", json.int(id)),
-        #("method", json.string(method)),
-      ])
-      |> json.to_string
-    event_bus.send_command(state.event_bus, event_bus.SendMessage(msg))
-  })
+  let #(ctx, next_id) =
+    list.fold(methods, #(state.context, state.next_request_id), fn(acc, method) {
+      let #(ctx, id) = acc
+      let msg = rpc_message(id, method)
+      event_bus.send_command(state.event_bus, event_bus.SendMessage(msg))
+      #(tracker.record_request(ctx, msg), id + 1)
+    })
+  State(..state, context: ctx, next_request_id: next_id)
+}
+
+fn rpc_message(id: Int, method: String) -> String {
+  json.object([
+    #("jsonrpc", json.string("2.0")),
+    #("id", json.int(id)),
+    #("method", json.string(method)),
+  ])
+  |> json.to_string
+}
+
+/// Remember artist name -> URI pairs from a track_playback_started event, so the
+/// recommender can browse an artist's catalogue by name later.
+fn index_artists(db: sqlight.Connection, raw: String) -> Nil {
+  let artists_decoder =
+    decode.at(
+      ["tl_track", "track", "artists"],
+      decode.list({
+        use uri <- decode.optional_field("uri", "", decode.string)
+        use name <- decode.optional_field("name", "", decode.string)
+        decode.success(#(name, uri))
+      }),
+    )
+  case json.parse(raw, artists_decoder) {
+    Ok(artists) ->
+      list.each(artists, fn(artist) {
+        case artist.0 != "" && artist.1 != "" {
+          True -> {
+            let _ =
+              queries.upsert_artist_index(db, artist.0, artist.1, now_ms())
+            Nil
+          }
+          False -> Nil
+        }
+      })
+    Error(_) -> Nil
+  }
 }
 
 // ─── State change detection and logging ────────────────────────────
@@ -272,6 +308,10 @@ fn process_state_change(state: State, raw: String) -> State {
       prune_attributions(state)
     }
     Some(etype) -> {
+      case etype == "track_started" {
+        True -> index_artists(state.db, raw)
+        False -> Nil
+      }
       // Volume debouncing: skip if too recent
       case etype == "volume" {
         True -> {
@@ -289,16 +329,15 @@ fn process_state_change(state: State, raw: String) -> State {
           case etype == "tracklist_changed" {
             True -> {
               let id = state.next_request_id
-              let msg =
-                json.object([
-                  #("jsonrpc", json.string("2.0")),
-                  #("id", json.int(id)),
-                  #("method", json.string("core.tracklist.get_tl_tracks")),
-                ])
-                |> json.to_string
+              let msg = rpc_message(id, "core.tracklist.get_tl_tracks")
               event_bus.send_command(state.event_bus, event_bus.SendMessage(msg))
-              let state = log_state_change(state, etype)
-              State(..state, next_request_id: id + 1)
+              let state =
+                State(
+                  ..state,
+                  context: tracker.record_request(state.context, msg),
+                  next_request_id: id + 1,
+                )
+              log_state_change(state, etype)
             }
             False -> log_state_change(state, etype)
           }
@@ -350,10 +389,32 @@ import gleam/dynamic/decode
 fn log_state_change(state: State, event_type: String) -> State {
   let now = now_ms()
   let ctx = state.context
+  let is_track_end = event_type == "track_ended"
+  let is_track_start = event_type == "track_started"
 
-  // Find attribution: match pending commands to this event
-  let #(user_id, remaining_attrs) =
+  // Find attribution: match pending commands to this event. A track that starts
+  // or ends on its own (natural playback) has no command behind it – credit the
+  // person who put it in the queue, otherwise no listening data ever accrues.
+  let #(explicit_user, remaining_attrs) =
     find_attribution(state.pending_attributions, event_type, now)
+  let user_id = case explicit_user, is_track_start || is_track_end, ctx.track_uri {
+    None, True, Some(uri) ->
+      queries.find_queued_by(state.db, uri) |> result.unwrap(None)
+    _, _, _ -> explicit_user
+  }
+
+  // How much of the track was heard (only meaningful when it just ended)
+  let #(listen_ms, listen_pct) = case ctx.position_ms, ctx.track_duration_ms {
+    Some(pos), Some(dur) ->
+      case dur > 0 {
+        True -> #(pos, int.to_float(pos) /. int.to_float(dur))
+        False -> #(pos, 0.0)
+      }
+    Some(pos), None -> #(pos, 0.0)
+    None, _ -> #(0, 0.0)
+  }
+  let is_skip = listen_pct <. 0.8
+  let is_early_skip = listen_pct <. 0.25
 
   let queue_length = list.length(ctx.tracklist)
 
@@ -386,9 +447,8 @@ fn log_state_change(state: State, event_type: String) -> State {
 
   let state = State(..state, pending_attributions: remaining_attrs)
 
-  // Upsert track features when we have track context
-  let is_track_end = event_type == "track_ended"
-  let is_track_start = event_type == "track_started"
+  // Upsert track features when we have track context. play = heard to (nearly)
+  // the end, skip = ended early – regardless of who, if anyone, gets the credit.
   case ctx.track_uri {
     Some(uri) -> {
       let _ =
@@ -405,8 +465,8 @@ fn log_state_change(state: State, event_type: String) -> State {
           ctx.track_no,
           ctx.disc_no,
           now,
-          is_track_start,
-          is_track_end,
+          is_track_end && !is_skip,
+          is_track_end && is_skip,
         )
       Nil
     }
@@ -416,22 +476,6 @@ fn log_state_change(state: State, event_type: String) -> State {
   // Affinity updates on track_ended (before context gets wiped)
   let state = case is_track_end, user_id {
     True, Some(uid) -> {
-      // Compute listen percentage
-      let #(listen_ms, listen_pct) = case ctx.position_ms, ctx.track_duration_ms
-      {
-        Some(pos), Some(dur) -> {
-          case dur > 0 {
-            True -> #(pos, int.to_float(pos) /. int.to_float(dur))
-            False -> #(pos, 0.0)
-          }
-        }
-        Some(pos), None -> #(pos, 0.0)
-        None, _ -> #(0, 0.0)
-      }
-
-      let is_skip = listen_pct <. 0.8
-      let is_early_skip = listen_pct <. 0.25
-
       // Update track affinity
       case ctx.track_uri {
         Some(uri) -> {

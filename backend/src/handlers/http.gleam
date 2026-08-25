@@ -1,5 +1,6 @@
 import auth/jwt.{type Jwt, type Verified}
 import auth/service
+import autoplay.{type AutoplayMessage}
 import db/queries
 import event_bus.{type BusMessage}
 import gleam/bytes_tree
@@ -16,6 +17,7 @@ import gleam/string
 import gleam/time/timestamp
 import logging
 import mist.{type ResponseData}
+import mopidy_rpc.{type RpcMessage}
 import playback_state.{type PlaybackStateMessage, type PlaybackStateSnapshot}
 import sqlight
 
@@ -25,6 +27,8 @@ pub type AppState {
     jwt_secret: String,
     event_bus: Subject(BusMessage),
     playback_state: Subject(PlaybackStateMessage),
+    rpc: Subject(RpcMessage),
+    autoplay: Subject(AutoplayMessage),
   )
 }
 
@@ -109,7 +113,10 @@ pub fn register(state: AppState, body: String) -> Response(ResponseData) {
         }
         Error(e) -> {
           let _ = logging.log(logging.Error, "Error creating user: " <> e)
-          error_response("Username already exists", 409)
+          case string.contains(e, "UNIQUE constraint failed") {
+            True -> error_response("Username already exists", 409)
+            False -> error_response("Could not create user", 500)
+          }
         }
       }
     }
@@ -537,7 +544,7 @@ pub fn get_playback_history(
   }
 }
 
-fn encode_playback_snapshot(snapshot: PlaybackStateSnapshot) -> json.Json {
+pub fn encode_playback_snapshot(snapshot: PlaybackStateSnapshot) -> json.Json {
   json.object([
     #("playback_state", json.nullable(snapshot.playback_state, json.string)),
     #("track_uri", json.nullable(snapshot.track_uri, json.string)),
@@ -663,7 +670,7 @@ fn create_jwt_token(
   Ok(token)
 }
 
-fn extract_token(auth_header: String) -> Result(String, String) {
+pub fn extract_token(auth_header: String) -> Result(String, String) {
   case string.starts_with(auth_header, "Bearer ") {
     True -> {
       string.drop_start(auth_header, 7)
@@ -673,14 +680,14 @@ fn extract_token(auth_header: String) -> Result(String, String) {
   }
 }
 
-fn verify_jwt_token(
+pub fn verify_jwt_token(
   token: String,
   secret: String,
 ) -> Result(Jwt(Verified), jwt.JwtDecodeError) {
   jwt.from_signed_string(token, secret)
 }
 
-fn get_user_id_from_jwt(jwt_data: Jwt(Verified)) -> Result(Int, String) {
+pub fn get_user_id_from_jwt(jwt_data: Jwt(Verified)) -> Result(Int, String) {
   use subject <- result.try(
     jwt.get_subject(jwt_data)
     |> result.replace_error("No subject in JWT"),
@@ -692,13 +699,13 @@ fn get_user_id_from_jwt(jwt_data: Jwt(Verified)) -> Result(Int, String) {
   }
 }
 
-fn respond_json(body: String, status: Int) -> Response(ResponseData) {
+pub fn respond_json(body: String, status: Int) -> Response(ResponseData) {
   response.new(status)
   |> response.prepend_header("content-type", "application/json")
   |> response.set_body(mist.Bytes(bytes_tree.from_string(body)))
 }
 
-fn error_response(message: String, status: Int) -> Response(ResponseData) {
+pub fn error_response(message: String, status: Int) -> Response(ResponseData) {
   json.object([#("error", json.string(message))])
   |> json.to_string
   |> respond_json(status)

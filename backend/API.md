@@ -83,74 +83,80 @@ Authorization: Bearer <token>
 
 ## Analytics
 
-All analytics endpoints require authentication.
-
-### `POST /api/analytics/actions`
-Log a user action (play, pause, skip, etc).
-
-**Headers:**
-```
-Authorization: Bearer <token>
-```
-
-**Body:**
-```json
-{
-  "action_type": "play",
-  "track_uri": "spotify:track:abc123",
-  "track_name": "Song Title",
-  "metadata": "{\"album\": \"Album Name\"}"
-}
-```
-
-**Response (200):**
-```json
-{
-  "success": true
-}
-```
-
-### `GET /api/analytics/actions`
-Get user's action history (last 100 actions).
-
-**Headers:**
-```
-Authorization: Bearer <token>
-```
-
-**Response (200):**
-```json
-[
-  {
-    "id": 1,
-    "action_type": "play",
-    "track_uri": "spotify:track:abc123",
-    "track_name": "Song Title",
-    "metadata": null,
-    "timestamp": 1705708800
-  }
-]
-```
+All analytics endpoints require `Authorization: Bearer <token>`.
 
 ### `GET /api/analytics/stats`
-Get aggregated statistics for user.
+Per-user event counts: `{ "playback": int, "queue": int, "search": int }`.
 
-**Headers:**
-```
-Authorization: Bearer <token>
-```
+### `GET /api/analytics/events`
+Latest 50 of the caller's playback / queue / search events plus global counts.
 
-**Response (200):**
+### `GET /api/analytics/affinity?limit=20`
+The caller's learned taste: `track_affinities[]` and `artist_affinities[]` ordered by score.
+
+### `GET /api/analytics/admin`
+Room-wide dashboard payload (user activity, hourly activity, popular tracks/searches, event distribution, now playing, state timeline).
+
+### `GET /api/analytics/export?offset=0&limit=1000`
+Raw event export across all users (ML training data).
+
+### `GET /api/playback/state`
+Public "now playing" snapshot (no auth): state, track, position, volume, `queue_length`.
+
+### `GET /api/playback/history?limit=50`
+Recent Mopidy state transitions with attribution (`user_id` when a person caused it).
+
+## Mix: recommendations, autoplay, insights
+
+### `GET /api/recommendations?scope=me|room&limit=20`
+Tracks to play next, built from listening history and Mopidy/Tidal discovery
+(artist top tracks, "<Artist> (Artist Radio)" mixes, the account's Daily Discovery).
+`scope=me` serves the caller's taste, `scope=room` blends everyone active in the last 7 days.
+Tracks currently queued, played in the last 12 h, or disliked are never suggested.
+
 ```json
 {
-  "play": 150,
-  "pause": 45,
-  "skip": 23,
-  "search": 12
+  "scope": "room",
+  "generated_at": 1787688541358,
+  "items": [
+    {
+      "uri": "tidal:track:…",
+      "name": "One of These Nights",
+      "artist": "Eagles",
+      "album": "One of These Nights",
+      "duration_ms": 291000,
+      "score": 1.12,
+      "reasons": ["Sounds like Korelon", "Daily discovery"]
+    }
+  ]
 }
 ```
 
----
+First call for a new set of seed artists can take several seconds (Tidal browsing);
+results are cached in `rpc_cache` for 6 h.
+
+### `GET /api/autoplay`
+```json
+{ "settings": { "enabled": false, "min_ahead": 2, "batch_size": 5, "discovery": 0.5, "mode": "room" }, "added_24h": 0 }
+```
+
+### `PUT /api/autoplay`
+Partial update of the same settings object. `mode` is `"room"` or `"user:<id>"`,
+`discovery` is 0.0–1.0 (favourites → new music), `min_ahead` 0–20, `batch_size` 1–20.
+When enabled, the autoplay actor appends `batch_size` recommended tracks whenever fewer
+than `min_ahead` tracks remain after the current one, and restarts playback if the queue
+had run dry. Additions are logged as `queue_events` under the `autoplay` system user and
+announced to browsers as a `{"event":"autoplay_added","count":n,"tracks":[…]}` frame.
+
+### `POST /api/autoplay/fill`
+Add a batch right now regardless of the threshold. Returns `{ "added": n }`, or 409 with
+an `error` when nothing could be recommended (e.g. no listening history yet).
+
+### `GET /api/insights`
+Everything the Mix → Stats page shows: `now_playing`, `autoplay`, `room` (totals, top
+tracks/artists, per-user taste map, plays by UTC hour for 7 d, plays per day for 14 d,
+active users, recent queue adds with usernames, recent plays) and `me` (top artists/tracks,
+counts, minutes listened).
 
 ## WebSocket
 

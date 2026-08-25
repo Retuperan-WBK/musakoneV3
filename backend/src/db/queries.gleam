@@ -1,6 +1,8 @@
 import gleam/dynamic/decode
 import gleam/option.{type Option}
 import gleam/result
+import gleam/string
+import gleam/list
 import sqlight
 
 pub type User {
@@ -598,14 +600,18 @@ pub fn get_user_activity_summary(
   let sql =
     "SELECT
        u.username,
-       COUNT(pe.id) as playback_events,
-       COUNT(qe.id) as queue_events,
-       COUNT(se.id) as search_events,
-       COUNT(pe.id) + COUNT(qe.id) + COUNT(se.id) as total_events
+       COALESCE(SUM(e.kind = 'playback'), 0) as playback_events,
+       COALESCE(SUM(e.kind = 'queue'), 0) as queue_events,
+       COALESCE(SUM(e.kind = 'search'), 0) as search_events,
+       COUNT(e.kind) as total_events
      FROM users u
-     LEFT JOIN playback_events pe ON u.id = pe.user_id
-     LEFT JOIN queue_events qe ON u.id = qe.user_id
-     LEFT JOIN search_events se ON u.id = se.user_id
+     LEFT JOIN (
+       SELECT user_id, 'playback' as kind FROM playback_events
+       UNION ALL
+       SELECT user_id, 'queue' FROM queue_events
+       UNION ALL
+       SELECT user_id, 'search' FROM search_events
+     ) e ON e.user_id = u.id
      GROUP BY u.id, u.username
      ORDER BY total_events DESC"
 
@@ -706,7 +712,7 @@ pub fn get_popular_searches(
        COUNT(*) as search_count,
        COUNT(DISTINCT user_id) as unique_users
      FROM search_events
-     WHERE event_type = 'query' AND query_text IS NOT NULL
+     WHERE event_type = 'search' AND query_text IS NOT NULL
      GROUP BY query_text
      ORDER BY search_count DESC
      LIMIT ?"
@@ -1832,4 +1838,446 @@ pub fn update_track_affinity_playlist(
     decode.dynamic,
   )
   |> result.map(fn(_) { Nil })
+}
+
+// ============================================================================
+// SETTINGS / ARTIST INDEX / RPC CACHE (V8)
+// ============================================================================
+
+pub fn get_settings(
+  db: sqlight.Connection,
+) -> Result(List(#(String, String)), sqlight.Error) {
+  let decoder = {
+    use key <- decode.field(0, decode.string)
+    use value <- decode.field(1, decode.string)
+    decode.success(#(key, value))
+  }
+  sqlight.query("SELECT key, value FROM settings", db, [], decoder)
+}
+
+pub fn set_setting(
+  db: sqlight.Connection,
+  key: String,
+  value: String,
+  now_ms: Int,
+) -> Result(Nil, sqlight.Error) {
+  sqlight.query(
+    "INSERT INTO settings (key, value, updated_ms) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ms = excluded.updated_ms",
+    db,
+    [sqlight.text(key), sqlight.text(value), sqlight.int(now_ms)],
+    decode.dynamic,
+  )
+  |> result.map(fn(_) { Nil })
+}
+
+pub fn upsert_artist_index(
+  db: sqlight.Connection,
+  artist_name: String,
+  artist_uri: String,
+  now_ms: Int,
+) -> Result(Nil, sqlight.Error) {
+  sqlight.query(
+    "INSERT INTO artist_index (artist_name, artist_uri, updated_ms) VALUES (?, ?, ?)
+     ON CONFLICT(artist_name) DO UPDATE SET artist_uri = excluded.artist_uri, updated_ms = excluded.updated_ms",
+    db,
+    [sqlight.text(artist_name), sqlight.text(artist_uri), sqlight.int(now_ms)],
+    decode.dynamic,
+  )
+  |> result.map(fn(_) { Nil })
+}
+
+/// Whole artist name -> URI index (small: one row per artist ever played)
+pub fn get_artist_index(
+  db: sqlight.Connection,
+) -> Result(List(#(String, String)), sqlight.Error) {
+  let decoder = {
+    use name <- decode.field(0, decode.string)
+    use uri <- decode.field(1, decode.string)
+    decode.success(#(name, uri))
+  }
+  sqlight.query("SELECT artist_name, artist_uri FROM artist_index", db, [], decoder)
+}
+
+/// Any track URI we have seen for an artist (used to resolve the artist URI via lookup)
+pub fn get_track_uri_for_artist(
+  db: sqlight.Connection,
+  artist_name: String,
+) -> Result(Option(String), sqlight.Error) {
+  sqlight.query(
+    "SELECT uri FROM track_features WHERE artist_name = ? ORDER BY play_count DESC LIMIT 1",
+    db,
+    [sqlight.text(artist_name)],
+    decode.at([0], decode.string),
+  )
+  |> result.map(fn(rows) { option.from_result(list.first(rows)) })
+}
+
+pub fn cache_get(
+  db: sqlight.Connection,
+  key: String,
+  max_age_ms: Int,
+  now_ms: Int,
+) -> Result(Option(String), sqlight.Error) {
+  sqlight.query(
+    "SELECT value FROM rpc_cache WHERE key = ? AND updated_ms > ?",
+    db,
+    [sqlight.text(key), sqlight.int(now_ms - max_age_ms)],
+    decode.at([0], decode.string),
+  )
+  |> result.map(fn(rows) { option.from_result(list.first(rows)) })
+}
+
+pub fn cache_put(
+  db: sqlight.Connection,
+  key: String,
+  value: String,
+  now_ms: Int,
+) -> Result(Nil, sqlight.Error) {
+  sqlight.query(
+    "INSERT INTO rpc_cache (key, value, updated_ms) VALUES (?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_ms = excluded.updated_ms",
+    db,
+    [sqlight.text(key), sqlight.text(value), sqlight.int(now_ms)],
+    decode.dynamic,
+  )
+  |> result.map(fn(_) { Nil })
+}
+
+// ============================================================================
+// ATTRIBUTION FALLBACK
+// ============================================================================
+
+/// The (human) user who most recently added this track to the queue, if any.
+/// Used to attribute natural track completions that no explicit command caused.
+pub fn find_queued_by(
+  db: sqlight.Connection,
+  track_uri: String,
+) -> Result(Option(Int), sqlight.Error) {
+  sqlight.query(
+    "SELECT qe.user_id FROM queue_events qe
+     JOIN users u ON u.id = qe.user_id
+     WHERE qe.event_type IN ('add', 'add_at_position')
+       AND u.username != 'autoplay'
+       AND qe.track_uris LIKE ?
+     ORDER BY qe.timestamp_ms DESC LIMIT 1",
+    db,
+    [sqlight.text("%\"" <> track_uri <> "\"%")],
+    decode.at([0], decode.int),
+  )
+  |> result.map(fn(rows) { option.from_result(list.first(rows)) })
+}
+
+// ============================================================================
+// RECOMMENDATION INPUTS
+// ============================================================================
+
+/// Users with any activity since `since_ms`: (id, username, last_activity_ms), most recent first
+pub fn get_active_users(
+  db: sqlight.Connection,
+  since_ms: Int,
+) -> Result(List(#(Int, String, Int)), sqlight.Error) {
+  let decoder = {
+    use id <- decode.field(0, decode.int)
+    use username <- decode.field(1, decode.string)
+    use last <- decode.field(2, decode.int)
+    decode.success(#(id, username, last))
+  }
+  sqlight.query(
+    "SELECT u.id, u.username, MAX(e.ts) as last_activity
+     FROM users u
+     JOIN (
+       SELECT user_id, timestamp_ms as ts FROM playback_events
+       UNION ALL
+       SELECT user_id, timestamp_ms FROM queue_events
+       UNION ALL
+       SELECT user_id, timestamp_ms FROM search_events
+     ) e ON e.user_id = u.id
+     WHERE e.ts > ? AND u.username != 'autoplay'
+     GROUP BY u.id, u.username
+     ORDER BY last_activity DESC",
+    db,
+    [sqlight.int(since_ms)],
+    decoder,
+  )
+}
+
+/// Users that have any positive affinity at all (fallback seed set when nobody is active)
+pub fn get_users_with_affinity(
+  db: sqlight.Connection,
+) -> Result(List(Int), sqlight.Error) {
+  sqlight.query(
+    "SELECT DISTINCT user_id FROM user_artist_affinity WHERE affinity_score > 0",
+    db,
+    [],
+    decode.at([0], decode.int),
+  )
+}
+
+pub fn get_recently_played_uris(
+  db: sqlight.Connection,
+  since_ms: Int,
+) -> Result(List(String), sqlight.Error) {
+  sqlight.query(
+    "SELECT DISTINCT track_uri FROM playback_state_log
+     WHERE event_type = 'track_started' AND timestamp_ms > ? AND track_uri IS NOT NULL",
+    db,
+    [sqlight.int(since_ms)],
+    decode.at([0], decode.string),
+  )
+}
+
+/// Tracks the user has skipped early or thrown out of the queue and never grew to like
+pub fn get_user_disliked_uris(
+  db: sqlight.Connection,
+  user_id: Int,
+) -> Result(List(String), sqlight.Error) {
+  sqlight.query(
+    "SELECT track_uri FROM user_track_affinity
+     WHERE user_id = ? AND (early_skip_count > 0 OR queue_remove_count > 0) AND affinity_score <= 0",
+    db,
+    [sqlight.int(user_id)],
+    decode.at([0], decode.string),
+  )
+}
+
+/// (uri, summed affinity, distinct users) across everyone
+pub fn get_room_top_tracks(
+  db: sqlight.Connection,
+  limit: Int,
+) -> Result(List(#(String, Float, Int)), sqlight.Error) {
+  let decoder = {
+    use uri <- decode.field(0, decode.string)
+    use score <- decode.field(1, decode.float)
+    use users <- decode.field(2, decode.int)
+    decode.success(#(uri, score, users))
+  }
+  sqlight.query(
+    "SELECT track_uri, SUM(affinity_score) * 1.0 as score, COUNT(DISTINCT user_id)
+     FROM user_track_affinity
+     GROUP BY track_uri
+     HAVING SUM(affinity_score) > 0
+     ORDER BY score DESC
+     LIMIT ?",
+    db,
+    [sqlight.int(limit)],
+    decoder,
+  )
+}
+
+/// (artist, summed affinity, distinct users, plays) across everyone
+pub fn get_room_top_artists(
+  db: sqlight.Connection,
+  limit: Int,
+) -> Result(List(#(String, Float, Int, Int)), sqlight.Error) {
+  let decoder = {
+    use name <- decode.field(0, decode.string)
+    use score <- decode.field(1, decode.float)
+    use users <- decode.field(2, decode.int)
+    use plays <- decode.field(3, decode.int)
+    decode.success(#(name, score, users, plays))
+  }
+  sqlight.query(
+    "SELECT artist_name, SUM(affinity_score) * 1.0 as score, COUNT(DISTINCT user_id), SUM(play_count)
+     FROM user_artist_affinity
+     GROUP BY artist_name
+     HAVING SUM(affinity_score) > 0
+     ORDER BY score DESC
+     LIMIT ?",
+    db,
+    [sqlight.int(limit)],
+    decoder,
+  )
+}
+
+/// Each user's top artists (for the room taste map): (user_id, artist, score)
+pub fn get_users_top_artists(
+  db: sqlight.Connection,
+  per_user: Int,
+) -> Result(List(#(Int, String, Float)), sqlight.Error) {
+  let decoder = {
+    use user_id <- decode.field(0, decode.int)
+    use name <- decode.field(1, decode.string)
+    use score <- decode.field(2, decode.float)
+    decode.success(#(user_id, name, score))
+  }
+  sqlight.query(
+    "SELECT user_id, artist_name, affinity_score * 1.0 FROM (
+       SELECT user_id, artist_name, affinity_score,
+              ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY affinity_score DESC) as rn
+       FROM user_artist_affinity WHERE affinity_score > 0
+     ) WHERE rn <= ?
+     ORDER BY user_id, affinity_score DESC",
+    db,
+    [sqlight.int(per_user)],
+    decoder,
+  )
+}
+
+pub type TrackMeta {
+  TrackMeta(
+    uri: String,
+    name: Option(String),
+    artist_name: Option(String),
+    album_name: Option(String),
+    duration_ms: Option(Int),
+    play_count: Int,
+    skip_count: Int,
+  )
+}
+
+/// Known metadata for a batch of track URIs
+pub fn get_track_meta_many(
+  db: sqlight.Connection,
+  uris: List(String),
+) -> Result(List(TrackMeta), sqlight.Error) {
+  case uris {
+    [] -> Ok([])
+    _ -> {
+      let placeholders =
+        list.map(uris, fn(_) { "?" }) |> string.join(", ")
+      let decoder = {
+        use uri <- decode.field(0, decode.string)
+        use name <- decode.field(1, decode.optional(decode.string))
+        use artist <- decode.field(2, decode.optional(decode.string))
+        use album <- decode.field(3, decode.optional(decode.string))
+        use duration <- decode.field(4, decode.optional(decode.int))
+        use plays <- decode.field(5, decode.int)
+        use skips <- decode.field(6, decode.int)
+        decode.success(TrackMeta(
+          uri:,
+          name:,
+          artist_name: artist,
+          album_name: album,
+          duration_ms: duration,
+          play_count: plays,
+          skip_count: skips,
+        ))
+      }
+      sqlight.query(
+        "SELECT uri, name, artist_name, album_name, duration_ms, play_count, skip_count
+         FROM track_features WHERE uri IN ("
+          <> placeholders
+          <> ")",
+        db,
+        list.map(uris, sqlight.text),
+        decoder,
+      )
+    }
+  }
+}
+
+// ============================================================================
+// INSIGHTS
+// ============================================================================
+
+/// Single integer result of an aggregate query
+pub fn scalar_int(
+  db: sqlight.Connection,
+  sql: String,
+  args: List(sqlight.Value),
+) -> Result(Int, sqlight.Error) {
+  sqlight.query(sql, db, args, decode.at([0], decode.int))
+  |> result.map(fn(rows) {
+    case rows {
+      [n, ..] -> n
+      [] -> 0
+    }
+  })
+}
+
+/// Plays per UTC hour-of-day since `since_ms` (from actual track starts, not clicks)
+pub fn get_hourly_plays(
+  db: sqlight.Connection,
+  since_ms: Int,
+) -> Result(List(#(Int, Int)), sqlight.Error) {
+  let decoder = {
+    use hour <- decode.field(0, decode.int)
+    use plays <- decode.field(1, decode.int)
+    decode.success(#(hour, plays))
+  }
+  sqlight.query(
+    "SELECT CAST(strftime('%H', datetime(timestamp_ms / 1000, 'unixepoch')) AS INTEGER) as hour,
+            COUNT(*)
+     FROM playback_state_log
+     WHERE event_type = 'track_started' AND timestamp_ms > ?
+     GROUP BY hour ORDER BY hour",
+    db,
+    [sqlight.int(since_ms)],
+    decoder,
+  )
+}
+
+/// Plays per UTC day since `since_ms`: (YYYY-MM-DD, plays)
+pub fn get_daily_plays(
+  db: sqlight.Connection,
+  since_ms: Int,
+) -> Result(List(#(String, Int)), sqlight.Error) {
+  let decoder = {
+    use day <- decode.field(0, decode.string)
+    use plays <- decode.field(1, decode.int)
+    decode.success(#(day, plays))
+  }
+  sqlight.query(
+    "SELECT strftime('%Y-%m-%d', datetime(timestamp_ms / 1000, 'unixepoch')) as day, COUNT(*)
+     FROM playback_state_log
+     WHERE event_type = 'track_started' AND timestamp_ms > ?
+     GROUP BY day ORDER BY day",
+    db,
+    [sqlight.int(since_ms)],
+    decoder,
+  )
+}
+
+/// Latest queue additions with who did them: (timestamp, username, names json, uris json, event_type)
+pub fn get_recent_queue_adds(
+  db: sqlight.Connection,
+  limit: Int,
+) -> Result(
+  List(#(Int, String, Option(String), Option(String), String)),
+  sqlight.Error,
+) {
+  let decoder = {
+    use ts <- decode.field(0, decode.int)
+    use username <- decode.field(1, decode.string)
+    use names <- decode.field(2, decode.optional(decode.string))
+    use uris <- decode.field(3, decode.optional(decode.string))
+    use event_type <- decode.field(4, decode.string)
+    decode.success(#(ts, username, names, uris, event_type))
+  }
+  sqlight.query(
+    "SELECT qe.timestamp_ms, u.username, qe.track_names, qe.track_uris, qe.event_type
+     FROM queue_events qe JOIN users u ON u.id = qe.user_id
+     WHERE qe.event_type IN ('add', 'add_at_position', 'autoplay')
+     ORDER BY qe.timestamp_ms DESC LIMIT ?",
+    db,
+    [sqlight.int(limit)],
+    decoder,
+  )
+}
+
+/// Most recent track starts: (timestamp, uri, name, artist, user_id)
+pub fn get_recent_plays(
+  db: sqlight.Connection,
+  limit: Int,
+) -> Result(
+  List(#(Int, Option(String), Option(String), Option(String), Option(Int))),
+  sqlight.Error,
+) {
+  let decoder = {
+    use ts <- decode.field(0, decode.int)
+    use uri <- decode.field(1, decode.optional(decode.string))
+    use name <- decode.field(2, decode.optional(decode.string))
+    use artist <- decode.field(3, decode.optional(decode.string))
+    use user_id <- decode.field(4, decode.optional(decode.int))
+    decode.success(#(ts, uri, name, artist, user_id))
+  }
+  sqlight.query(
+    "SELECT timestamp_ms, track_uri, track_name, artist_name, user_id
+     FROM playback_state_log WHERE event_type = 'track_started'
+     ORDER BY timestamp_ms DESC LIMIT ?",
+    db,
+    [sqlight.int(limit)],
+    decoder,
+  )
 }

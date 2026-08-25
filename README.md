@@ -9,7 +9,8 @@ A lightweight, mobile-first web frontend for Mopidy music server with a terminal
 - ⚡ **Lightweight**: < 50KB gzipped bundle size
 - 🔄 **Real-time Updates**: WebSocket integration for live playback status
 - 📱 **PWA Support**: Install on mobile home screen
-- 🎹 **Full Control**: Playback, queue management, library browsing, and search
+- 🎹 **Full Control**: Playback, queue management (drag to reorder), library browsing, and search
+- ✨ **Mix**: Recommendations from the room's listening history + Tidal discovery, autoplay that keeps the queue from running dry, and listening stats
 - 🐳 **Docker Ready**: Easy deployment with Docker Compose
 
 ## Architecture
