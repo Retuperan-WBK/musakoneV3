@@ -34,10 +34,14 @@ export function Login() {
     };
 
     return (
-        <div className="flex flex-col items-center justify-center min-h-screen p-4 bg-bg-primary">
-            <div className="w-full max-w-[400px] p-6 md:p-8 bg-bg-secondary border border-border-primary shadow-lg">
-                <h1 className="m-0 mb-2 text-xl font-semibold text-accent-primary text-center">MusakoneV3</h1>
-                <p className="m-0 mb-8 text-sm text-fg-secondary text-center">Sign in to continue</p>
+        <div className="flex flex-col items-center h-full overflow-y-auto p-4 bg-bg-primary">
+            <div className="w-full max-w-[400px] my-auto p-6 md:p-8 bg-bg-secondary border border-border-primary shadow-lg">
+                <h1 className="m-0 mb-2 text-xl font-semibold text-accent-primary text-center">
+                    MusakoneV3
+                </h1>
+                <p className="m-0 mb-8 text-sm text-fg-secondary text-center">
+                    Sign in to continue
+                </p>
 
                 {error && (
                     <div className="p-4 text-sm text-error bg-error/10 border border-error rounded-sm text-center mb-4">
@@ -89,7 +93,10 @@ export function Login() {
 
                 <p className="mt-6 text-sm text-fg-secondary text-center">
                     Don't have an account?{' '}
-                    <a href="/register" className="text-accent-primary border-b border-transparent hover:border-accent-primary transition-colors duration-200">
+                    <a
+                        href="/register"
+                        className="text-accent-primary border-b border-transparent hover:border-accent-primary transition-colors duration-200"
+                    >
                         Create one
                     </a>
                 </p>

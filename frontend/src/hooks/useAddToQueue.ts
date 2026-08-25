@@ -25,19 +25,20 @@ export function useAddToQueue() {
      */
     const addNext = async (uris: string | string[]) => {
         try {
-            const queue = await mopidy.getTracklist();
-            const currentTlid = await mopidy.getCurrentTlid();
-            let insertPosition = 0;
-
-            if (currentTlid) {
-                const currentIndex = queue.findIndex((t) => t.tlid === currentTlid);
-                if (currentIndex !== -1) {
-                    insertPosition = currentIndex + 1;
-                }
-            }
-
+            const [queue, currentTlid] = await Promise.all([
+                mopidy.getTracklist(),
+                mopidy.getCurrentTlid(),
+            ]);
             const uriArray = Array.isArray(uris) ? uris : [uris];
-            await mopidy.addToTracklist(uriArray, insertPosition);
+
+            // Right after the current track; if nothing is playing, append (never jump the queue)
+            const currentIndex =
+                currentTlid === null ? -1 : queue.findIndex((t) => t.tlid === currentTlid);
+            if (currentIndex === -1) {
+                await mopidy.addToTracklist(uriArray);
+            } else {
+                await mopidy.addToTracklist(uriArray, currentIndex + 1);
+            }
         } catch (err) {
             console.error('Failed to add next:', err);
             throw err;

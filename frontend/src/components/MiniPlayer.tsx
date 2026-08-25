@@ -1,7 +1,6 @@
 import { useStore } from '@nanostores/preact';
 import { Pause, Play, SkipBack, SkipForward, Volume2 } from 'lucide-preact';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { useLocation } from 'wouter';
 import * as mopidy from '../services/mopidy';
 import {
     currentTrack,
@@ -18,6 +17,9 @@ const BACKEND_SYNC_INTERVAL_SECONDS = 10;
 
 /** Threshold in ms - if position is below this, previous goes to previous track */
 const PREVIOUS_THRESHOLD_MS = 3000;
+
+/** The volume popup closes by itself after this much time without adjustments */
+const VOLUME_AUTO_CLOSE_MS = 4000;
 
 export function MiniPlayer() {
     const track = useStore(currentTrack);
@@ -69,7 +71,7 @@ export function MiniPlayer() {
 
     // Close volume popup when clicking outside
     useEffect(() => {
-        const handleClickOutside = (event: MouseEvent) => {
+        const handleClickOutside = (event: Event) => {
             if (
                 volumeOpen &&
                 volumePopupRef.current &&
@@ -81,14 +83,18 @@ export function MiniPlayer() {
 
         if (volumeOpen) {
             document.addEventListener('mousedown', handleClickOutside);
-            document.addEventListener('touchstart', handleClickOutside as any);
+            document.addEventListener('touchstart', handleClickOutside);
         }
+        const autoClose = volumeOpen
+            ? window.setTimeout(() => setVolumeOpen(false), VOLUME_AUTO_CLOSE_MS)
+            : null;
 
         return () => {
+            if (autoClose !== null) clearTimeout(autoClose);
             document.removeEventListener('mousedown', handleClickOutside);
-            document.removeEventListener('touchstart', handleClickOutside as any);
+            document.removeEventListener('touchstart', handleClickOutside);
         };
-    }, [volumeOpen]);
+    }, [volumeOpen, currentVolume]);
 
     const handlePlayPause = async () => {
         try {
@@ -164,7 +170,10 @@ export function MiniPlayer() {
     };
 
     return (
-        <div className="w-full bg-bg-tertiary border-t border-border-primary flex flex-col" style={{ height: 'var(--mini-player-height)', flexShrink: 0 }}>
+        <div
+            className="w-full bg-bg-tertiary border-t border-border-primary flex flex-col"
+            style={{ height: 'var(--mini-player-height)', flexShrink: 0 }}
+        >
             {/* Progress bar */}
             <div className="progress-bar" style={{ '--progress': `${progress}%` }}>
                 {track && (
@@ -172,31 +181,36 @@ export function MiniPlayer() {
                         type="range"
                         className="absolute -top-1.5 left-0 w-full h-4 m-0 opacity-0 cursor-pointer"
                         style={{ zIndex: 0, pointerEvents: 'none' }}
-                            min={0}
-                            max={track.duration || 100}
-                            value={position}
-                            onChange={handleSeek}
-                            aria-label="Seek"
-                        />
+                        min={0}
+                        max={track.duration || 100}
+                        value={position}
+                        onChange={handleSeek}
+                        aria-label="Seek"
+                    />
                 )}
             </div>
 
             <div className="flex items-center px-2 py-1 gap-1">
-                <div
-                    className={`flex-1 min-w-0 flex flex-col gap-0.5 ${track ? 'cursor-pointer select-none active:opacity-70' : ''}`}
+                <button
+                    type="button"
+                    className={`flex-1 min-w-0 flex flex-col items-start gap-0.5 bg-transparent border-none p-0 text-left font-mono ${track ? 'cursor-pointer select-none active:opacity-70' : 'cursor-default'}`}
                     onClick={handleTrackClick}
+                    disabled={!track}
+                    aria-label="Show current track in queue"
                 >
                     {track ? (
                         <>
-                            <div className="text-base text-fg-primary truncate">{track.name}</div>
-                            <div className="text-sm text-fg-secondary truncate">
+                            <div className="w-full text-base text-fg-primary truncate">
+                                {track.name}
+                            </div>
+                            <div className="w-full text-sm text-fg-secondary truncate">
                                 {track.artists?.map((a) => a.name).join(', ') || 'Unknown Artist'}
                             </div>
                         </>
                     ) : (
                         <div className="text-fg-tertiary italic">No track playing</div>
                     )}
-                </div>
+                </button>
 
                 {track && (
                     <div className="text-xs text-fg-tertiary whitespace-nowrap shrink-0">
@@ -206,6 +220,7 @@ export function MiniPlayer() {
 
                 <div className="flex gap-1 shrink-0">
                     <button
+                        type="button"
                         className="btn-control"
                         onClick={handlePrevious}
                         disabled={!track}
@@ -215,6 +230,7 @@ export function MiniPlayer() {
                     </button>
 
                     <button
+                        type="button"
                         className={`btn-control ${playing ? '' : ''} bg-accent-primary text-bg-primary border-accent-primary hover:brightness-110 active:brightness-90`}
                         onClick={handlePlayPause}
                         disabled={!track}
@@ -224,6 +240,7 @@ export function MiniPlayer() {
                     </button>
 
                     <button
+                        type="button"
                         className="btn-control"
                         onClick={handleNext}
                         disabled={!track}
@@ -233,8 +250,13 @@ export function MiniPlayer() {
                     </button>
                 </div>
 
-                <div className="relative flex items-center shrink-0" ref={volumePopupRef} style={{ zIndex: 200 }}>
+                <div
+                    className="relative flex items-center shrink-0"
+                    ref={volumePopupRef}
+                    style={{ zIndex: 200 }}
+                >
                     <button
+                        type="button"
                         className={`btn-control ${volumeOpen ? 'border-accent-primary' : ''}`}
                         onClick={() => setVolumeOpen(!volumeOpen)}
                         onKeyDown={(e) => {
@@ -249,7 +271,10 @@ export function MiniPlayer() {
                     </button>
 
                     {volumeOpen && (
-                        <div className="absolute bottom-[calc(100%+0.5rem)] right-0 bg-bg-tertiary border border-border-primary rounded-lg py-2 flex flex-col items-center gap-2 z-100 shadow-lg" style={{ zIndex: 202 }}>
+                        <div
+                            className="absolute bottom-[calc(100%+0.5rem)] right-0 bg-bg-tertiary border border-border-primary rounded-lg py-2 flex flex-col items-center gap-2 z-100 shadow-lg"
+                            style={{ zIndex: 202 }}
+                        >
                             <input
                                 type="range"
                                 className="volume-slider"
@@ -259,7 +284,9 @@ export function MiniPlayer() {
                                 onChange={handleVolumeChange}
                                 aria-label="Volume"
                             />
-                            <div className="text-xs text-fg-secondary min-w-10 text-center">{currentVolume}%</div>
+                            <div className="text-xs text-fg-secondary min-w-10 text-center">
+                                {currentVolume}%
+                            </div>
                         </div>
                     )}
                 </div>

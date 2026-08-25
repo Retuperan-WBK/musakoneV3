@@ -1,8 +1,8 @@
 import { Check, ListPlus, Plus } from 'lucide-preact';
+import type { JSX } from 'preact';
 import { openAddToPlaylistModal } from '../stores/playlists';
 import { SwipeableItem } from './SwipeableItem';
-import { TrackItem, DefaultTrackIcon, type TrackItemData } from './TrackItem';
-import type { JSX } from 'preact';
+import { DefaultTrackIcon, TrackItem, type TrackItemData } from './TrackItem';
 
 export interface SwipeableTrackItemProps {
     /** Track data to display */
@@ -62,49 +62,52 @@ export function SwipeableTrackItem({
             threshold={threshold}
             className="flex items-center bg-bg-primary min-h-12 w-full relative z-1 transition-transform duration-100"
         >
-            <>
-                <TrackItem
-                    track={track}
-                    icon={icon}
-                    showAlbum={showAlbum}
-                    showDuration={showDuration}
-                    customMeta={customMeta}
-                    rightContent={
-                        <>
-                            {trackUri && (
-                                <button
-                                    className="flex items-center justify-center w-8 h-8 bg-transparent border border-border-primary text-fg-tertiary cursor-pointer shrink-0 transition-all duration-150 hover:text-accent-primary hover:border-accent-primary active:bg-bg-secondary"
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        openAddToPlaylistModal(trackUri);
-                                    }}
-                                    aria-label={`Add ${track.name} to playlist`}
-                                    title="Add to playlist"
-                                >
-                                    <ListPlus size={18} />
-                                </button>
-                            )}
-                            {isQueued ? (
-                                <div className="flex items-center justify-center w-8 h-8 text-success shrink-0" title="Already in queue">
-                                    <Check size={18} />
-                                </div>
-                            ) : (
-                                <button
-                                    className="flex items-center justify-center w-8 h-8 bg-transparent border border-border-primary text-fg-tertiary cursor-pointer shrink-0 transition-all duration-150 hover:text-accent-primary hover:border-accent-primary active:bg-bg-secondary"
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        onAdd();
-                                    }}
-                                    aria-label={`Add ${track.name} to queue`}
-                                    title="Add to queue"
-                                >
-                                    <Plus size={18} />
-                                </button>
-                            )}
-                        </>
-                    }
-                />
-            </>
+            <TrackItem
+                track={track}
+                icon={icon}
+                showAlbum={showAlbum}
+                showDuration={showDuration}
+                customMeta={customMeta}
+                rightContent={
+                    <>
+                        {trackUri && (
+                            <button
+                                type="button"
+                                className="flex items-center justify-center w-8 h-8 bg-transparent border border-border-primary text-fg-tertiary cursor-pointer shrink-0 transition-all duration-150 hover:text-accent-primary hover:border-accent-primary active:bg-bg-secondary"
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    openAddToPlaylistModal(trackUri);
+                                }}
+                                aria-label={`Add ${track.name} to playlist`}
+                                title="Add to playlist"
+                            >
+                                <ListPlus size={18} />
+                            </button>
+                        )}
+                        {isQueued ? (
+                            <div
+                                className="flex items-center justify-center w-8 h-8 text-success shrink-0"
+                                title="Already in queue"
+                            >
+                                <Check size={18} />
+                            </div>
+                        ) : (
+                            <button
+                                type="button"
+                                className="flex items-center justify-center w-8 h-8 bg-transparent border border-border-primary text-fg-tertiary cursor-pointer shrink-0 transition-all duration-150 hover:text-accent-primary hover:border-accent-primary active:bg-bg-secondary"
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    onAdd();
+                                }}
+                                aria-label={`Add ${track.name} to queue`}
+                                title="Add to queue"
+                            >
+                                <Plus size={18} />
+                            </button>
+                        )}
+                    </>
+                }
+            />
         </SwipeableItem>
     );
 }

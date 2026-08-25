@@ -1,42 +1,45 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useStore } from '@nanostores/preact';
+import { useEffect } from 'preact/hooks';
 import type { PlaybackOptions } from '../services/mopidy';
 import * as mopidy from '../services/mopidy';
+import { playbackOptions, setPlaybackOptions } from '../stores/player';
+import { toastError } from '../stores/toast';
+
+const FLAGS: Array<{ key: keyof PlaybackOptions; letter: string; title: string }> = [
+    { key: 'repeat', letter: 'r', title: 'Repeat' },
+    { key: 'random', letter: 'z', title: 'Random/Shuffle' },
+    { key: 'single', letter: 's', title: 'Single' },
+    { key: 'consume', letter: 'c', title: 'Consume' },
+];
 
 /**
  * ncmpcpp-style playback flags display
- * Shows [rzscp] where each letter is active/inactive
+ * Shows [rzsc] where each letter is active/inactive
  * r = repeat, z = random, s = single, c = consume
+ *
+ * State lives in the shared store, which the Mopidy client keeps in sync via
+ * `options_changed` events – so every phone shows what the player is really doing.
  */
 export function PlaybackFlags() {
-    const [options, setOptions] = useState<PlaybackOptions>({
-        repeat: false,
-        random: false,
-        single: false,
-        consume: false,
-    });
-    const [loading, setLoading] = useState(true);
-
-    const loadOptions = async () => {
-        try {
-            const opts = await mopidy.getPlaybackOptions();
-            setOptions(opts);
-        } catch (err) {
-            console.error('Failed to load playback options:', err);
-        } finally {
-            setLoading(false);
-        }
-    };
+    const options = useStore(playbackOptions);
 
     useEffect(() => {
-        loadOptions();
-    }, []);
+        if (options === null) {
+            mopidy
+                .getPlaybackOptions()
+                .then(setPlaybackOptions)
+                .catch((err) => {
+                    console.error('Failed to load playback options:', err);
+                });
+        }
+    }, [options]);
 
     const toggleOption = async (key: keyof PlaybackOptions) => {
+        if (!options) return;
         const newValue = !options[key];
-        const prevOptions = { ...options };
 
-        // Optimistic update
-        setOptions({ ...options, [key]: newValue });
+        // Optimistic update; the options_changed event confirms (or corrects) it
+        setPlaybackOptions({ ...options, [key]: newValue });
 
         try {
             switch (key) {
@@ -55,46 +58,35 @@ export function PlaybackFlags() {
             }
         } catch (err) {
             console.error(`Failed to toggle ${key}:`, err);
-            // Revert on error
-            setOptions(prevOptions);
+            setPlaybackOptions(options);
+            toastError(`Could not change ${key}`);
         }
     };
 
-    if (loading) {
-        return <div className="font-mono text-xs text-fg-secondary inline-flex items-center select-none">[____]</div>;
+    if (!options) {
+        return (
+            <div className="font-mono text-xs text-fg-secondary inline-flex items-center select-none">
+                [____]
+            </div>
+        );
     }
 
     return (
         <div className="font-mono text-xs text-fg-secondary inline-flex items-center select-none">
             [
-            <button
-                className={`playback-flag ${options.repeat ? 'playback-flag-active' : ''}`}
-                onClick={() => toggleOption('repeat')}
-                title="Repeat"
-            >
-                {options.repeat ? 'r' : '_'}
-            </button>
-            <button
-                className={`playback-flag ${options.random ? 'playback-flag-active' : ''}`}
-                onClick={() => toggleOption('random')}
-                title="Random/Shuffle"
-            >
-                {options.random ? 'z' : '_'}
-            </button>
-            <button
-                className={`playback-flag ${options.single ? 'playback-flag-active' : ''}`}
-                onClick={() => toggleOption('single')}
-                title="Single"
-            >
-                {options.single ? 's' : '_'}
-            </button>
-            <button
-                className={`playback-flag ${options.consume ? 'playback-flag-active' : ''}`}
-                onClick={() => toggleOption('consume')}
-                title="Consume"
-            >
-                {options.consume ? 'c' : '_'}
-            </button>
+            {FLAGS.map(({ key, letter, title }) => (
+                <button
+                    type="button"
+                    key={key}
+                    className={`playback-flag ${options[key] ? 'playback-flag-active' : ''}`}
+                    onClick={() => toggleOption(key)}
+                    title={title}
+                    aria-label={title}
+                    aria-pressed={options[key]}
+                >
+                    {options[key] ? letter : '_'}
+                </button>
+            ))}
             ]
         </div>
     );

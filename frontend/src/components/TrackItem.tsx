@@ -1,5 +1,5 @@
-import type { JSX } from 'preact';
 import { Music } from 'lucide-preact';
+import type { JSX } from 'preact';
 import { formatDuration } from '../utils/format';
 
 export interface TrackItemData {
@@ -49,20 +49,41 @@ export function TrackItem({
     onDoubleClick,
 }: TrackItemProps) {
     const artistNames = track.artists?.map((a) => a.name).join(', ') || 'Unknown Artist';
-    const metadata = customMeta || (showAlbum && track.album ? `${artistNames} • ${track.album.name}` : artistNames);
+    const metadata =
+        customMeta ||
+        (showAlbum && track.album ? `${artistNames} • ${track.album.name}` : artistNames);
 
     return (
+        // biome-ignore lint/a11y/noStaticElementInteractions: role/tabIndex/keyboard are set whenever onClick is given
         <div
             className={`track-item ${className}`}
+            role={onClick ? 'button' : undefined}
+            tabIndex={onClick ? 0 : undefined}
             onClick={onClick}
             onDblClick={onDoubleClick}
+            onKeyDown={
+                onClick
+                    ? (e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              onClick();
+                          }
+                      }
+                    : undefined
+            }
         >
             {leftContent && <div className="flex items-center shrink-0">{leftContent}</div>}
 
-            {icon && <div className="flex items-center justify-center text-fg-secondary shrink-0">{icon}</div>}
+            {icon && (
+                <div className="flex items-center justify-center text-fg-secondary shrink-0">
+                    {icon}
+                </div>
+            )}
 
             <div className="flex-1 min-w-0 flex flex-col gap-0">
-                <div className="text-base font-medium text-fg-primary truncate leading-tight">{track.name}</div>
+                <div className="text-base font-medium text-fg-primary truncate leading-tight">
+                    {track.name}
+                </div>
                 <div className="text-sm text-fg-secondary truncate leading-tight">{metadata}</div>
             </div>
 

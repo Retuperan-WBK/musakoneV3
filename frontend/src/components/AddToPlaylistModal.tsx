@@ -1,6 +1,7 @@
 import { useStore } from '@nanostores/preact';
 import { Check, ListMusic, Plus, X } from 'lucide-preact';
 import { useEffect, useState } from 'preact/hooks';
+import { useModalDismiss } from '../hooks/useModalDismiss';
 import * as playlistService from '../services/playlists';
 import {
     addToPlaylistModalOpen,
@@ -9,6 +10,7 @@ import {
     playlists,
     setPlaylists,
 } from '../stores/playlists';
+import { showToast, toastError } from '../stores/toast';
 import type { Playlist } from '../types';
 
 /**
@@ -32,6 +34,8 @@ function AddToPlaylistModalInner({ trackUri }: { trackUri: string }) {
     const [loading, setLoading] = useState(false);
     const [containingIds, setContainingIds] = useState<Set<number>>(new Set());
 
+    useModalDismiss(closeAddToPlaylistModal);
+
     useEffect(() => {
         let cancelled = false;
 
@@ -43,7 +47,9 @@ function AddToPlaylistModalInner({ trackUri }: { trackUri: string }) {
             })
             .catch(console.error);
 
-        return () => { cancelled = true; };
+        return () => {
+            cancelled = true;
+        };
     }, [trackUri]);
 
     const handleAdd = async (playlist: Playlist) => {
@@ -52,8 +58,10 @@ function AddToPlaylistModalInner({ trackUri }: { trackUri: string }) {
         try {
             await playlistService.addTrackToPlaylist(playlist.id, trackUri);
             setContainingIds(new Set([...containingIds, playlist.id]));
+            showToast(`Added to ${playlist.name}`, 'success');
         } catch (err) {
             console.error('Failed to add track to playlist:', err);
+            toastError(`Could not add to ${playlist.name}`);
         } finally {
             setLoading(false);
         }
@@ -69,16 +77,20 @@ function AddToPlaylistModalInner({ trackUri }: { trackUri: string }) {
             setContainingIds(new Set([...containingIds, playlist.id]));
             const updated = await playlistService.listPlaylists();
             setPlaylists(updated);
-        } catch (err) {
-            console.error('Failed to create playlist:', err);
-        } finally {
-            setLoading(false);
+            showToast(`Created ${name}`, 'success');
             setNewName('');
             setCreating(false);
+        } catch (err) {
+            console.error('Failed to create playlist:', err);
+            toastError(`Could not create playlist ${name}`);
+        } finally {
+            setLoading(false);
         }
     };
 
     return (
+        // biome-ignore lint/a11y/noStaticElementInteractions: backdrop; Escape/Back handled by useModalDismiss
+        // biome-ignore lint/a11y/useKeyWithClickEvents: backdrop; Escape/Back handled by useModalDismiss
         <div
             className="fixed inset-0 z-200 flex items-end justify-center bg-black/60"
             onClick={(e) => {
@@ -90,6 +102,7 @@ function AddToPlaylistModalInner({ trackUri }: { trackUri: string }) {
                 <div className="flex items-center justify-between px-4 py-3 border-b border-border-primary shrink-0">
                     <span className="text-fg-primary text-sm font-medium">Add to Playlist</span>
                     <button
+                        type="button"
                         className="flex items-center justify-center w-8 h-8 bg-transparent border-none text-fg-tertiary cursor-pointer transition-colors duration-150 hover:text-fg-primary"
                         onClick={closeAddToPlaylistModal}
                     >
@@ -103,13 +116,19 @@ function AddToPlaylistModalInner({ trackUri }: { trackUri: string }) {
                         const alreadyAdded = containingIds.has(playlist.id);
                         return (
                             <button
+                                type="button"
                                 key={playlist.id}
                                 className={`flex items-center gap-3 w-full px-4 py-3 bg-transparent border-none border-b-2 border-border-secondary text-left transition-all duration-150 ${alreadyAdded ? 'opacity-60 cursor-default' : 'cursor-pointer hover:bg-bg-tertiary'} ${loading ? 'opacity-50 pointer-events-none' : ''}`}
                                 onClick={() => handleAdd(playlist)}
                                 disabled={alreadyAdded}
                             >
-                                <ListMusic size={18} className={`shrink-0 ${alreadyAdded ? 'text-success' : 'text-fg-tertiary'}`} />
-                                <span className="text-fg-primary text-sm truncate flex-1">{playlist.name}</span>
+                                <ListMusic
+                                    size={18}
+                                    className={`shrink-0 ${alreadyAdded ? 'text-success' : 'text-fg-tertiary'}`}
+                                />
+                                <span className="text-fg-primary text-sm truncate flex-1">
+                                    {playlist.name}
+                                </span>
                                 {alreadyAdded && (
                                     <Check size={16} className="text-success shrink-0" />
                                 )}
@@ -137,6 +156,7 @@ function AddToPlaylistModalInner({ trackUri }: { trackUri: string }) {
                                 autoFocus
                             />
                             <button
+                                type="button"
                                 className="px-3 py-1 bg-accent-primary text-fg-primary font-mono text-sm border-none cursor-pointer"
                                 onClick={handleCreate}
                                 disabled={loading}
@@ -146,6 +166,7 @@ function AddToPlaylistModalInner({ trackUri }: { trackUri: string }) {
                         </div>
                     ) : (
                         <button
+                            type="button"
                             className="flex items-center gap-2 w-full px-0 py-1 bg-transparent border-none text-fg-secondary text-sm cursor-pointer transition-colors duration-150 hover:text-accent-primary"
                             onClick={() => setCreating(true)}
                         >

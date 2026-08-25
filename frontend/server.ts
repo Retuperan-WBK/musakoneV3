@@ -17,7 +17,7 @@ const serveStatic = async (req: Request): Promise<Response> => {
     // Serve runtime config
     if (url.pathname === '/config.json') {
         return new Response(JSON.stringify(runtimeConfig), {
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
         });
     }
 
@@ -27,11 +27,18 @@ const serveStatic = async (req: Request): Promise<Response> => {
     if (!(await file.exists())) {
         const indexFile = Bun.file('./dist/index.html');
         return new Response(indexFile, {
-            headers: { 'Content-Type': 'text/html' },
+            headers: { 'Content-Type': 'text/html', 'Cache-Control': 'no-cache' },
         });
     }
 
-    return new Response(file);
+    // Vite emits content-hashed files under /assets – safe to cache forever. Everything else
+    // (index.html, sw.js, manifest, icons) must be revalidated so deploys take effect.
+    const immutable = path.startsWith('/assets/');
+    return new Response(file, {
+        headers: {
+            'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
+        },
+    });
 };
 
 Bun.serve({

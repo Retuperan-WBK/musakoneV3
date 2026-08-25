@@ -6,13 +6,14 @@ import { TrackItem } from '../components/TrackItem';
 import { useAddToQueue } from '../hooks/useAddToQueue';
 import * as mopidy from '../services/mopidy';
 import * as playlistService from '../services/playlists';
-import { queue } from '../stores/queue';
 import {
     currentPlaylist,
     currentPlaylistTracks,
     setCurrentPlaylist,
     setCurrentPlaylistTracks,
 } from '../stores/playlists';
+import { queue } from '../stores/queue';
+import { toastError } from '../stores/toast';
 import type { Track } from '../types';
 
 export function PlaylistDetailView() {
@@ -51,8 +52,9 @@ export function PlaylistDetailView() {
                     const lookupResult = await mopidy.lookup(uris);
                     const infoMap = new Map<string, Track>();
                     for (const [uri, trackList] of lookupResult) {
-                        if (trackList.length > 0) {
-                            infoMap.set(uri, trackList[0]);
+                        const first = trackList[0];
+                        if (first) {
+                            infoMap.set(uri, first);
                         }
                     }
                     setTrackInfo(infoMap);
@@ -82,6 +84,7 @@ export function PlaylistDetailView() {
             await addToQueue(tracks.map((t) => t.track_uri));
         } catch (err) {
             console.error('Failed to queue playlist tracks:', err);
+            toastError('Could not add playlist to queue');
         }
     };
 
@@ -92,6 +95,7 @@ export function PlaylistDetailView() {
             await loadPlaylist();
         } catch (err) {
             console.error('Failed to remove track:', err);
+            toastError('Could not remove track');
         }
     };
 
@@ -105,15 +109,22 @@ export function PlaylistDetailView() {
     const handleSaveEdit = async () => {
         if (!playlistId || !editName.trim()) return;
         try {
-            await playlistService.updatePlaylist(playlistId, editName.trim(), editDesc.trim() || undefined);
+            await playlistService.updatePlaylist(
+                playlistId,
+                editName.trim(),
+                editDesc.trim() || undefined
+            );
             setEditing(false);
             await loadPlaylist();
         } catch (err) {
             console.error('Failed to update playlist:', err);
+            toastError('Could not save playlist');
         }
     };
 
-    const getTrackDisplay = (trackUri: string): { name: string; artists?: Array<{ name: string }>; duration?: number } => {
+    const getTrackDisplay = (
+        trackUri: string
+    ): { name: string; artists?: Array<{ name: string }>; duration?: number } => {
         const info = trackInfo.get(trackUri);
         if (info) {
             return {
@@ -127,7 +138,11 @@ export function PlaylistDetailView() {
     };
 
     if (loading) {
-        return <div className="flex items-center justify-center min-h-[50vh] text-fg-secondary">Loading...</div>;
+        return (
+            <div className="flex items-center justify-center min-h-[50vh] text-fg-secondary">
+                Loading...
+            </div>
+        );
     }
 
     if (error) {
@@ -135,6 +150,7 @@ export function PlaylistDetailView() {
             <div className="flex flex-col items-center justify-center min-h-[50vh] gap-4 text-error text-center px-8">
                 <p>{error}</p>
                 <button
+                    type="button"
                     className="px-4 py-2 bg-bg-tertiary border border-border-primary text-fg-primary font-mono text-sm cursor-pointer transition-all duration-150 hover:text-accent-primary hover:border-accent-primary"
                     onClick={loadPlaylist}
                 >
@@ -145,7 +161,11 @@ export function PlaylistDetailView() {
     }
 
     if (!playlist) {
-        return <div className="flex items-center justify-center min-h-[50vh] text-fg-secondary">Playlist not found</div>;
+        return (
+            <div className="flex items-center justify-center min-h-[50vh] text-fg-secondary">
+                Playlist not found
+            </div>
+        );
     }
 
     return (
@@ -153,6 +173,7 @@ export function PlaylistDetailView() {
             {/* Header */}
             <div className="flex items-center gap-2 px-3 py-2 border-b border-border-primary shrink-0 bg-bg-secondary">
                 <button
+                    type="button"
                     className="flex items-center justify-center w-8 h-8 bg-transparent border-none text-fg-secondary cursor-pointer transition-colors duration-150 hover:text-accent-primary"
                     onClick={() => setLocation('/playlists')}
                     aria-label="Back to playlists"
@@ -175,12 +196,14 @@ export function PlaylistDetailView() {
                             autoFocus
                         />
                         <button
+                            type="button"
                             className="px-2 py-1 bg-accent-primary text-fg-primary font-mono text-xs border-none cursor-pointer"
                             onClick={handleSaveEdit}
                         >
                             Save
                         </button>
                         <button
+                            type="button"
                             className="flex items-center justify-center w-6 h-6 bg-transparent border-none text-fg-tertiary cursor-pointer"
                             onClick={() => setEditing(false)}
                         >
@@ -190,12 +213,17 @@ export function PlaylistDetailView() {
                 ) : (
                     <>
                         <div className="flex-1 min-w-0">
-                            <div className="text-fg-primary truncate text-sm font-medium">{playlist.name}</div>
+                            <div className="text-fg-primary truncate text-sm font-medium">
+                                {playlist.name}
+                            </div>
                             {playlist.description && (
-                                <div className="text-xs text-fg-tertiary truncate">{playlist.description}</div>
+                                <div className="text-xs text-fg-tertiary truncate">
+                                    {playlist.description}
+                                </div>
                             )}
                         </div>
                         <button
+                            type="button"
                             className="flex items-center justify-center w-8 h-8 bg-transparent border border-border-primary text-fg-tertiary cursor-pointer shrink-0 transition-all duration-150 hover:text-accent-primary hover:border-accent-primary"
                             onClick={handleEdit}
                             aria-label="Edit playlist"
@@ -210,6 +238,7 @@ export function PlaylistDetailView() {
             {tracks.length > 0 && (
                 <div className="flex items-center gap-2 px-4 py-2 border-b border-border-secondary bg-bg-secondary">
                     <button
+                        type="button"
                         className="flex items-center gap-1 px-3 py-1 bg-transparent border border-border-primary text-fg-secondary text-sm font-mono cursor-pointer transition-all duration-150 hover:text-accent-primary hover:border-accent-primary"
                         onClick={handlePlayAll}
                     >
@@ -227,7 +256,7 @@ export function PlaylistDetailView() {
                     <p className="text-xs text-fg-tertiary">Add tracks from Library or Search</p>
                 </div>
             ) : (
-                <div className="flex-1 overflow-y-auto pb-[var(--total-bottom-offset)] md:pb-0">
+                <div className="flex-1 overflow-y-auto overscroll-y-contain pb-2">
                     {tracks.map((pt, index) => {
                         const display = getTrackDisplay(pt.track_uri);
                         return (
@@ -236,9 +265,14 @@ export function PlaylistDetailView() {
                                 track={display}
                                 icon={<Music size={20} />}
                                 showDuration={!!display.duration}
-                                customMeta={queuedUris.has(pt.track_uri) ? `#${index + 1} · in queue` : undefined}
+                                customMeta={
+                                    queuedUris.has(pt.track_uri)
+                                        ? `#${index + 1} · in queue`
+                                        : undefined
+                                }
                                 rightContent={
                                     <button
+                                        type="button"
                                         className="flex items-center justify-center w-8 h-8 bg-transparent border border-border-primary text-fg-tertiary cursor-pointer shrink-0 transition-all duration-150 hover:text-error hover:border-error"
                                         onClick={() => handleRemoveTrack(pt.track_uri)}
                                         aria-label="Remove from playlist"

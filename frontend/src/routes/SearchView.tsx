@@ -23,6 +23,7 @@ import {
     setSearchResults,
     setSearchTab,
 } from '../stores/search';
+import { toastError } from '../stores/toast';
 import type { Album, Artist, Track } from '../types';
 
 export function SearchView() {
@@ -39,6 +40,7 @@ export function SearchView() {
     const [, setLocation] = useLocation();
     const hasInitialized = useRef(false);
     const pendingSearch = useRef<string | null>(null);
+    const searchSeq = useRef(0);
     const { addToQueue, addNext } = useAddToQueue();
 
     const updateUrl = useCallback((searchQuery: string, currentTab: string) => {
@@ -70,14 +72,18 @@ export function SearchView() {
             setSearchError(null);
             updateUrl(trimmed, tab);
 
+            // Only the most recent search may update the results
+            const seq = ++searchSeq.current;
             try {
                 const results = await mopidy.search(trimmed);
+                if (seq !== searchSeq.current) return;
                 setSearchResults(results.tracks, results.artists, results.albums);
             } catch (err) {
+                if (seq !== searchSeq.current) return;
                 console.error('Search failed:', err);
                 setSearchError(err instanceof Error ? err.message : 'Search failed');
             } finally {
-                setSearchLoading(false);
+                if (seq === searchSeq.current) setSearchLoading(false);
             }
         },
         [tab, updateUrl]
@@ -125,6 +131,7 @@ export function SearchView() {
             await addToQueue(track.uri);
         } catch (err) {
             console.error('Failed to add track:', err);
+            toastError(`Could not add ${track.name} to queue`);
         }
     };
 
@@ -133,6 +140,7 @@ export function SearchView() {
             await addNext(track.uri);
         } catch (err) {
             console.error('Failed to add track next:', err);
+            toastError(`Could not add ${track.name} to queue`);
         }
     };
 
@@ -145,6 +153,7 @@ export function SearchView() {
             }
         } catch (err) {
             console.error('Failed to add artist tracks:', err);
+            toastError(`Could not add ${artist.name} to queue`);
         }
     };
 
@@ -157,6 +166,7 @@ export function SearchView() {
             }
         } catch (err) {
             console.error('Failed to add album tracks:', err);
+            toastError(`Could not add ${album.name} to queue`);
         }
     };
 
@@ -175,9 +185,13 @@ export function SearchView() {
     const hasResults = tracks.length > 0 || artists.length > 0 || albums.length > 0;
 
     return (
-        <div className="flex flex-col h-full overflow-hidden"> 
+        <div className="flex flex-col h-full overflow-hidden">
             {/* Search input */}
-            <form className="flex gap-0 border-b border-border-primary shrink-0" onSubmit={handleSubmit} autoComplete="off">
+            <form
+                className="flex gap-0 border-b border-border-primary shrink-0"
+                onSubmit={handleSubmit}
+                autoComplete="off"
+            >
                 <div className="flex-1 flex items-center bg-bg-secondary border border-border-primary focus-within:border-accent-primary transition-colors duration-150">
                     <Search size={18} className="text-fg-tertiary shrink-0" />
                     <input
@@ -216,6 +230,7 @@ export function SearchView() {
             {hasResults && (
                 <div className="flex border-b border-border-primary overflow-x-auto shrink-0 scrollbar-none">
                     <button
+                        type="button"
                         className={`flex items-center gap-1 shrink-0 min-h-12 px-6 bg-transparent border-none border-b-2 border-b-transparent text-fg-secondary font-mono text-sm cursor-pointer whitespace-nowrap transition-all duration-150 hover:text-fg-primary hover:bg-bg-secondary ${tab === 'tracks' ? 'text-accent-primary border-b-accent-primary' : ''}`}
                         onClick={() => {
                             setSearchTab('tracks');
@@ -226,6 +241,7 @@ export function SearchView() {
                         Tracks ({tracks.length})
                     </button>
                     <button
+                        type="button"
                         className={`flex items-center gap-1 shrink-0 min-h-12 px-6 bg-transparent border-none border-b-2 border-b-transparent text-fg-secondary font-mono text-sm cursor-pointer whitespace-nowrap transition-all duration-150 hover:text-fg-primary hover:bg-bg-secondary ${tab === 'artists' ? 'text-accent-primary border-b-accent-primary' : ''}`}
                         onClick={() => {
                             setSearchTab('artists');
@@ -236,6 +252,7 @@ export function SearchView() {
                         Artists ({artists.length})
                     </button>
                     <button
+                        type="button"
                         className={`flex items-center gap-1 shrink-0 min-h-12 px-6 bg-transparent border-none border-b-2 border-b-transparent text-fg-secondary font-mono text-sm cursor-pointer whitespace-nowrap transition-all duration-150 hover:text-fg-primary hover:bg-bg-secondary ${tab === 'albums' ? 'text-accent-primary border-b-accent-primary' : ''}`}
                         onClick={() => {
                             setSearchTab('albums');
@@ -250,11 +267,14 @@ export function SearchView() {
 
             {/* Results */}
             {loading ? (
-                <div className="flex items-center justify-center min-h-[50vh] text-fg-secondary">Searching...</div>
+                <div className="flex items-center justify-center min-h-[50vh] text-fg-secondary">
+                    Searching...
+                </div>
             ) : error ? (
                 <div className="flex flex-col items-center justify-center min-h-[50vh] gap-4 text-error text-center px-8">
                     <p>{error}</p>
                     <button
+                        type="button"
                         className="px-4 py-2 bg-bg-secondary border border-border-primary text-fg-secondary font-mono text-sm cursor-pointer transition-all duration-150 hover:text-accent-primary hover:border-accent-primary"
                         onClick={() => handleSearch(query)}
                     >
@@ -271,7 +291,7 @@ export function SearchView() {
                     <p>No results found for "{query}"</p>
                 </div>
             ) : (
-                <div className="flex-1 overflow-y-auto pb-[var(--total-bottom-offset)] md:pb-0">
+                <div className="flex-1 overflow-y-auto overscroll-y-contain pb-2">
                     {tab === 'tracks' && (
                         <div className="flex flex-col">
                             {tracks.map((track) => (
@@ -285,7 +305,6 @@ export function SearchView() {
                                     showAlbum={true}
                                     leftLabel="+ Queue Next"
                                     rightLabel="+ Queue"
-                                    threshold={160}
                                 />
                             ))}
                         </div>
@@ -293,19 +312,33 @@ export function SearchView() {
                     {tab === 'artists' && (
                         <div className="flex flex-col">
                             {artists.map((artist) => (
+                                // biome-ignore lint/a11y/useSemanticElements: the row contains its own <button>s, so it cannot be a <button>
                                 <div
                                     key={artist.uri}
+                                    role="button"
+                                    tabIndex={0}
                                     className="flex items-center gap-2 px-2 py-1 bg-bg-primary min-h-11 transition-transform duration-100 cursor-pointer active:bg-bg-secondary"
                                     onClick={() => handleArtistClick(artist)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter' || e.key === ' ') {
+                                            e.preventDefault();
+                                            (e.currentTarget as HTMLElement).click();
+                                        }
+                                    }}
                                 >
                                     <div className="flex items-center justify-center w-6 h-6 text-fg-secondary shrink-0">
                                         <User size={20} />
                                     </div>
                                     <div className="flex-1 min-w-0 flex flex-col gap-0.5">
-                                        <div className="text-fg-primary truncate">{artist.name}</div>
-                                        <div className="text-sm text-fg-secondary truncate">Artist</div>
+                                        <div className="text-fg-primary truncate">
+                                            {artist.name}
+                                        </div>
+                                        <div className="text-sm text-fg-secondary truncate">
+                                            Artist
+                                        </div>
                                     </div>
                                     <button
+                                        type="button"
                                         className="btn-icon"
                                         onClick={(e) => {
                                             e.stopPropagation();
@@ -323,10 +356,19 @@ export function SearchView() {
                     {tab === 'albums' && (
                         <div className="flex flex-col">
                             {albums.map((album) => (
+                                // biome-ignore lint/a11y/useSemanticElements: the row contains its own <button>s, so it cannot be a <button>
                                 <div
                                     key={album.uri}
+                                    role="button"
+                                    tabIndex={0}
                                     className="flex items-center gap-2 px-2 py-1 bg-bg-primary min-h-11 transition-transform duration-100 cursor-pointer active:bg-bg-secondary"
                                     onClick={() => handleAlbumClick(album)}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter' || e.key === ' ') {
+                                            e.preventDefault();
+                                            (e.currentTarget as HTMLElement).click();
+                                        }
+                                    }}
                                 >
                                     <div className="flex items-center justify-center w-6 h-6 text-accent-secondary shrink-0">
                                         <Disc size={20} />
@@ -334,10 +376,12 @@ export function SearchView() {
                                     <div className="flex-1 min-w-0 flex flex-col gap-0.5">
                                         <div className="text-fg-primary truncate">{album.name}</div>
                                         <div className="text-sm text-fg-secondary truncate">
-                                            {album.artists?.map((a) => a.name).join(', ') || 'Unknown Artist'}
+                                            {album.artists?.map((a) => a.name).join(', ') ||
+                                                'Unknown Artist'}
                                         </div>
                                     </div>
                                     <button
+                                        type="button"
                                         className="btn-icon"
                                         onClick={(e) => {
                                             e.stopPropagation();

@@ -24,7 +24,7 @@ export const libraryError = atom<string | null>(null);
 
 // Current URI being browsed
 export const currentUri = computed(libraryPath, (path) => {
-    return path.length > 0 ? path[path.length - 1].uri : null;
+    return path[path.length - 1]?.uri ?? null;
 });
 
 // Actions

@@ -9,6 +9,7 @@ import { AddToPlaylistModal } from './AddToPlaylistModal';
 import { BottomNav } from './BottomNav';
 import { ConfirmModal } from './ConfirmModal';
 import { MiniPlayer } from './MiniPlayer';
+import { Toast } from './Toast';
 
 interface LayoutProps {
     children: ComponentChildren;
@@ -62,6 +63,7 @@ export function Layout({ children }: LayoutProps) {
                     <span>{getStatusLabel()}</span>
                     {user && (
                         <button
+                            type="button"
                             className="ml-3 px-3 py-1 font-mono text-xs text-fg-secondary bg-transparent border border-border-primary cursor-pointer transition-all duration-200 hover:text-accent-primary hover:border-accent-primary active:opacity-70"
                             onClick={handleLogout}
                         >
@@ -72,9 +74,7 @@ export function Layout({ children }: LayoutProps) {
             </header>
 
             {/* Row 2: Scrollable content */}
-            <main className="app-main flex flex-col">
-                {children}
-            </main>
+            <main className="app-main flex flex-col">{children}</main>
 
             {/* Row 3: Bottom controls – BottomNav is in-flow; MiniPlayer is fixed above it */}
             <div className="bottom-controls">
@@ -82,13 +82,22 @@ export function Layout({ children }: LayoutProps) {
             </div>
 
             {location === '/' && (
-                <div style={{ position: 'fixed', left: 0, right: 0, bottom: 'var(--bottom-nav-height)', zIndex: 120 }}>
+                <div
+                    style={{
+                        position: 'fixed',
+                        left: 0,
+                        right: 0,
+                        bottom: 'var(--bottom-nav-height)',
+                        zIndex: 120,
+                    }}
+                >
                     <MiniPlayer />
                 </div>
             )}
 
             <AddToPlaylistModal />
             <ConfirmModal />
+            <Toast />
         </div>
     );
 }

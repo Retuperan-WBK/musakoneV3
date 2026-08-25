@@ -1,5 +1,5 @@
-import { getConfigSync } from './config';
 import type { Playlist, PlaylistWithTracks } from '../types';
+import { getConfigSync } from './config';
 
 function getBackendUrl(): string {
     return getConfigSync().backendHttpUrl;
@@ -52,7 +52,11 @@ export async function getPlaylist(id: number): Promise<PlaylistWithTracks> {
     return handleResponse(response);
 }
 
-export async function updatePlaylist(id: number, name: string, description?: string): Promise<Playlist> {
+export async function updatePlaylist(
+    id: number,
+    name: string,
+    description?: string
+): Promise<Playlist> {
     const response = await fetch(`${getBackendUrl()}/api/playlists/${id}`, {
         method: 'PUT',
         headers: getAuthHeaders(),
@@ -87,7 +91,11 @@ export async function removeTrackFromPlaylist(playlistId: number, trackUri: stri
     await handleResponse(response);
 }
 
-export async function reorderPlaylistTrack(playlistId: number, trackUri: string, newPosition: number): Promise<void> {
+export async function reorderPlaylistTrack(
+    playlistId: number,
+    trackUri: string,
+    newPosition: number
+): Promise<void> {
     const response = await fetch(`${getBackendUrl()}/api/playlists/${playlistId}/tracks/reorder`, {
         method: 'PUT',
         headers: getAuthHeaders(),

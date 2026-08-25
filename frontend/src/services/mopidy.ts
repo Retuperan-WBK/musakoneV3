@@ -4,8 +4,9 @@
  */
 
 import { setConnectionStatus } from '../stores/connection';
-import { updatePlaybackState } from '../stores/player';
+import { setPlaybackOptions, updatePlaybackState } from '../stores/player';
 import { setQueue } from '../stores/queue';
+import { showToast } from '../stores/toast';
 import type { Album, Artist, QueueTrack, Track } from '../types';
 import { getToken } from './auth';
 import { getConfigSync } from './config';
@@ -82,6 +83,10 @@ class MopidyWebSocket {
     private url: string;
     private connected = false;
     private connectionPromise: Promise<void> | null = null;
+    /** Set by disconnect() so a deliberate close does not trigger reconnection */
+    private intentionalClose = false;
+    /** Guards against out-of-order tracklist refreshes */
+    private tracklistSeq = 0;
 
     constructor(url?: string) {
         this.url = url || getConfigSync().backendWsUrl;
@@ -96,65 +101,84 @@ class MopidyWebSocket {
             return this.connectionPromise;
         }
 
+        this.intentionalClose = false;
         this.connectionPromise = new Promise((resolve, reject) => {
             // Build WebSocket URL with auth token
             const token = getToken();
             const wsUrl = token ? `${this.url}?token=${encodeURIComponent(token)}` : this.url;
 
+            // The promise must always settle: callers `await connect()` before every RPC, and a
+            // never-settling promise leaves views stuck in their loading state forever.
+            let settled = false;
+            const fail = (error: Error) => {
+                if (settled) return;
+                settled = true;
+                if (this.connectionPromise === promise) this.connectionPromise = null;
+                reject(error);
+            };
+
             console.log('Connecting to backend:', this.url);
             setConnectionStatus('connecting');
 
+            let ws: WebSocket;
             try {
-                this.ws = new WebSocket(wsUrl);
-
-                this.ws.onopen = () => {
-                    console.log('Backend WebSocket connected');
-                    this.connected = true;
-                    this.reconnectDelay = 1000;
-                    this.connectionPromise = null;
-                    setConnectionStatus('connected');
-                    resolve();
-
-                    // Load initial state after connection
-                    this.loadInitialState();
-                };
-
-                this.ws.onmessage = (event) => {
-                    try {
-                        const message = JSON.parse(event.data);
-                        this.handleMessage(message);
-                    } catch (error) {
-                        console.error('Failed to parse message:', error);
-                    }
-                };
-
-                this.ws.onerror = (error) => {
-                    console.error('Backend WebSocket error:', error);
-                    setConnectionStatus('error', 'Connection error');
-                };
-
-                this.ws.onclose = () => {
-                    console.log('Backend WebSocket closed');
-                    this.connected = false;
-                    this.connectionPromise = null;
-                    setConnectionStatus('disconnected');
-                    this.rejectAllPending();
-                    this.scheduleReconnect();
-                };
+                ws = new WebSocket(wsUrl);
             } catch (error) {
                 console.error('Failed to create WebSocket:', error);
-                this.connectionPromise = null;
                 setConnectionStatus('error', 'Failed to connect');
-                reject(error);
+                fail(error instanceof Error ? error : new Error(String(error)));
                 this.scheduleReconnect();
+                return;
             }
-        });
+            this.ws = ws;
 
-        return this.connectionPromise;
+            ws.onopen = () => {
+                console.log('Backend WebSocket connected');
+                this.connected = true;
+                this.reconnectDelay = 1000;
+                this.connectionPromise = null;
+                setConnectionStatus('connected');
+                settled = true;
+                resolve();
+
+                // Load initial state after connection
+                this.loadInitialState();
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    this.handleMessage(message);
+                } catch (error) {
+                    console.error('Failed to parse message:', error);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('Backend WebSocket error:', error);
+                setConnectionStatus('error', 'Connection error');
+                fail(new Error('WebSocket connection failed'));
+            };
+
+            ws.onclose = () => {
+                console.log('Backend WebSocket closed');
+                fail(new Error('WebSocket closed'));
+                if (this.ws !== ws) return; // a stale socket closing after disconnect()/reconnect
+                this.ws = null;
+                this.connected = false;
+                this.connectionPromise = null;
+                setConnectionStatus('disconnected');
+                this.rejectAllPending();
+                this.scheduleReconnect();
+            };
+        });
+        const promise = this.connectionPromise;
+
+        return promise;
     }
 
     private scheduleReconnect(): void {
-        if (this.reconnectTimeout) {
+        if (this.reconnectTimeout || this.intentionalClose) {
             return;
         }
 
@@ -175,23 +199,24 @@ class MopidyWebSocket {
     }
 
     private handleMessage(message: JsonRpcResponse | MopidyEvent): void {
-        // Handle JSON-RPC response
-        if ('id' in message && message.id !== undefined) {
-            const pending = this.pendingRequests.get(message.id);
-            if (pending) {
-                this.pendingRequests.delete(message.id);
-                if (message.error) {
-                    pending.reject(new Error(message.error.message));
-                } else {
-                    pending.resolve(message.result);
-                }
-            }
+        // Mopidy event (forwarded from backend)
+        if ('event' in message && typeof message.event === 'string') {
+            this.handleEvent(message);
             return;
         }
 
-        // Handle Mopidy event (forwarded from backend)
-        if ('event' in message) {
-            this.handleEvent(message as MopidyEvent);
+        // JSON-RPC response
+        const response = message as JsonRpcResponse;
+        if (typeof response.id === 'number') {
+            const pending = this.pendingRequests.get(response.id);
+            if (pending) {
+                this.pendingRequests.delete(response.id);
+                if (response.error) {
+                    pending.reject(new Error(response.error.message));
+                } else {
+                    pending.resolve(response.result);
+                }
+            }
         }
     }
 
@@ -236,14 +261,27 @@ class MopidyWebSocket {
                 break;
             }
 
-            case 'tracklist_changed':
-                // Refresh queue
+            case 'tracklist_changed': {
+                // Refresh queue; only the newest in-flight refresh may win
+                const seq = ++this.tracklistSeq;
                 this.getTracklist()
                     .then((tracks) => {
-                        setQueue(tracks);
+                        if (seq === this.tracklistSeq) setQueue(tracks);
                     })
                     .catch(console.error);
                 break;
+            }
+
+            case 'options_changed':
+                this.getPlaybackOptions().then(setPlaybackOptions).catch(console.error);
+                break;
+
+            case 'autoplay_added': {
+                // Synthetic event from the backend's autoplay actor
+                const count = typeof event.count === 'number' ? event.count : 0;
+                showToast(`Autoplay added ${count} ${count === 1 ? 'track' : 'tracks'}`, 'info');
+                break;
+            }
 
             case 'volume_changed':
                 if (event.volume !== undefined) {
@@ -275,11 +313,13 @@ class MopidyWebSocket {
             updatePlaybackState({
                 state: state as 'playing' | 'paused' | 'stopped',
                 currentTrack: tlTrack ? convertTrack(tlTrack.track) : null,
-                timePosition: timePosition || 0,
-                volume: volume || 80,
+                timePosition: timePosition ?? 0,
+                volume: volume ?? 80, // 0 is a valid (muted) volume
             });
 
+            this.tracklistSeq++;
             setQueue(tracklist.map(convertTlTrack));
+            this.getPlaybackOptions().then(setPlaybackOptions).catch(console.error);
         } catch (err) {
             console.error('Failed to load initial state:', err);
         }
@@ -326,15 +366,18 @@ class MopidyWebSocket {
     }
 
     disconnect(): void {
+        this.intentionalClose = true;
         if (this.reconnectTimeout) {
             clearTimeout(this.reconnectTimeout);
             this.reconnectTimeout = null;
         }
-        if (this.ws) {
-            this.ws.close();
-            this.ws = null;
-        }
+        const ws = this.ws;
+        this.ws = null; // detach first so the socket's onclose does not schedule a reconnect
         this.connected = false;
+        this.connectionPromise = null;
+        if (ws) {
+            ws.close();
+        }
         this.rejectAllPending();
         setConnectionStatus('disconnected');
     }
@@ -429,7 +472,7 @@ class MopidyWebSocket {
 
     async getCurrentTlid(): Promise<number | null> {
         const tlTrack = await this.rpc<MopidyTlTrack | null>('core.playback.get_current_tl_track');
-        return tlTrack?.tlid || null;
+        return tlTrack?.tlid ?? null;
     }
 
     // Library browsing
@@ -512,7 +555,7 @@ class MopidyWebSocket {
         return {
             state,
             currentTrack: currentTlTrack ? convertTrack(currentTlTrack.track) : null,
-            currentTlid: currentTlTrack?.tlid || null,
+            currentTlid: currentTlTrack?.tlid ?? null,
             timePosition,
             volume,
             repeat,
@@ -630,7 +673,8 @@ export const addToTracklist = (uris: string[], pos?: number) =>
 export const removeFromTracklist = (tlids: number[]) => mopidyClient.removeFromTracklist(tlids);
 export const clearTracklist = () => mopidyClient.clearTracklist();
 export const shuffleTracklist = () => mopidyClient.shuffleTracklist();
-export const moveTrack = (start: number, end: number, toPosition: number) => mopidyClient.moveTrack(start, end, toPosition);
+export const moveTrack = (start: number, end: number, toPosition: number) =>
+    mopidyClient.moveTrack(start, end, toPosition);
 export const getCurrentTlid = () => mopidyClient.getCurrentTlid();
 export const browse = (uri?: string) => mopidyClient.browse(uri);
 export const lookup = (uris: string[]) => mopidyClient.lookup(uris);

@@ -1,5 +1,6 @@
 // Nanostores for state management
 import { atom, computed } from 'nanostores';
+import type { PlaybackOptions } from '../services/mopidy';
 import type { PlaybackState, Track } from '../types';
 
 // Playback State
@@ -10,8 +11,15 @@ export const volume = atom<number>(80);
 export const repeat = atom<'off' | 'track' | 'all'>('off');
 export const random = atom<boolean>(false);
 
+// Tracklist options (repeat / random / single / consume); null until first loaded
+export const playbackOptions = atom<PlaybackOptions | null>(null);
+
 // Computed values
 export const isPlaying = computed(playbackState, (state) => state === 'playing');
+
+export function setPlaybackOptions(options: PlaybackOptions): void {
+    playbackOptions.set(options);
+}
 
 // Helper function to get full playback state
 export function getPlaybackState(): PlaybackState {

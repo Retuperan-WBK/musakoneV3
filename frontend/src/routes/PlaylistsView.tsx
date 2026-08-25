@@ -12,6 +12,7 @@ import {
     setPlaylistsError,
     setPlaylistsLoading,
 } from '../stores/playlists';
+import { toastError } from '../stores/toast';
 
 export function PlaylistsView() {
     const items = useStore(playlists);
@@ -48,6 +49,7 @@ export function PlaylistsView() {
             await loadPlaylists();
         } catch (err) {
             console.error('Failed to create playlist:', err);
+            toastError('Could not create playlist');
         }
     };
 
@@ -64,6 +66,7 @@ export function PlaylistsView() {
                     await loadPlaylists();
                 } catch (err) {
                     console.error('Failed to delete playlist:', err);
+                    toastError('Could not delete playlist');
                 }
             },
         });
@@ -75,6 +78,7 @@ export function PlaylistsView() {
             <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary shrink-0 bg-bg-secondary">
                 <span className="text-fg-secondary text-sm">Playlists</span>
                 <button
+                    type="button"
                     className="flex items-center gap-1 px-2 py-1 bg-transparent border border-border-primary text-fg-secondary text-sm font-mono cursor-pointer transition-all duration-150 hover:text-accent-primary hover:border-accent-primary"
                     onClick={() => setCreating(!creating)}
                 >
@@ -100,6 +104,7 @@ export function PlaylistsView() {
                         autoFocus
                     />
                     <button
+                        type="button"
                         className="px-3 py-1 bg-accent-primary text-fg-primary font-mono text-sm border-none cursor-pointer"
                         onClick={handleCreate}
                     >
@@ -110,11 +115,14 @@ export function PlaylistsView() {
 
             {/* Content */}
             {loading && items.length === 0 ? (
-                <div className="flex items-center justify-center min-h-[50vh] text-fg-secondary">Loading...</div>
+                <div className="flex items-center justify-center min-h-[50vh] text-fg-secondary">
+                    Loading...
+                </div>
             ) : error ? (
                 <div className="flex flex-col items-center justify-center min-h-[50vh] gap-4 text-error text-center px-8">
                     <p>{error}</p>
                     <button
+                        type="button"
                         className="px-4 py-2 bg-bg-tertiary border border-border-primary text-fg-primary font-mono text-sm cursor-pointer transition-all duration-150 hover:text-accent-primary hover:border-accent-primary"
                         onClick={loadPlaylists}
                     >
@@ -128,21 +136,33 @@ export function PlaylistsView() {
                     <p className="text-sm text-fg-tertiary">Tap "New" to create one</p>
                 </div>
             ) : (
-                <div className="flex-1 overflow-y-auto pb-[var(--total-bottom-offset)] md:pb-0">
+                <div className="flex-1 overflow-y-auto overscroll-y-contain pb-2">
                     {items.map((playlist) => (
+                        // biome-ignore lint/a11y/useSemanticElements: the row contains its own <button>s, so it cannot be a <button>
                         <div
                             key={playlist.id}
+                            role="button"
+                            tabIndex={0}
                             className="flex items-center gap-3 px-4 py-3 bg-bg-primary border-b-2 border-border-secondary cursor-pointer transition-all duration-150 active:bg-bg-tertiary"
                             onClick={() => setLocation(`/playlists/${playlist.id}`)}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    (e.currentTarget as HTMLElement).click();
+                                }
+                            }}
                         >
                             <ListMusic size={20} className="text-fg-tertiary shrink-0" />
                             <div className="flex-1 min-w-0">
                                 <div className="text-fg-primary truncate">{playlist.name}</div>
                                 {playlist.description && (
-                                    <div className="text-sm text-fg-tertiary truncate">{playlist.description}</div>
+                                    <div className="text-sm text-fg-tertiary truncate">
+                                        {playlist.description}
+                                    </div>
                                 )}
                             </div>
                             <button
+                                type="button"
                                 className="flex items-center justify-center w-8 h-8 bg-transparent border border-border-primary text-fg-tertiary cursor-pointer shrink-0 transition-all duration-150 hover:text-error hover:border-error"
                                 onClick={(e) => handleDelete(playlist.id, playlist.name, e)}
                                 aria-label={`Delete ${playlist.name}`}
