@@ -80,7 +80,8 @@ class MopidyWebSocket {
     private reconnectTimeout: number | null = null;
     private reconnectDelay = 1000;
     private maxReconnectDelay = 30000;
-    private url: string;
+    /** Explicit URL override (tests); otherwise resolved from runtime config at connect time */
+    private readonly urlOverride: string | undefined;
     private connected = false;
     private connectionPromise: Promise<void> | null = null;
     /** Set by disconnect() so a deliberate close does not trigger reconnection */
@@ -89,7 +90,17 @@ class MopidyWebSocket {
     private tracklistSeq = 0;
 
     constructor(url?: string) {
-        this.url = url || getConfigSync().backendWsUrl;
+        this.urlOverride = url;
+    }
+
+    /**
+     * The singleton is created while the module is evaluated, before getConfig() has fetched
+     * /config.json, so the URL must be read lazily: capturing it in the constructor would lock in
+     * the ws://host:3001 fallback and, on an HTTPS page, make `new WebSocket()` throw a mixed-content
+     * SecurityError before any request is sent.
+     */
+    private get url(): string {
+        return this.urlOverride || getConfigSync().backendWsUrl;
     }
 
     connect(): Promise<void> {

@@ -5,7 +5,9 @@
  */
 
 export interface AppConfig {
+    /** Backend base URL for HTTP requests, e.g. https://mb.rwbk.fi */
     backendHttpUrl: string;
+    /** Backend WebSocket URL derived from the base URL, e.g. wss://mb.rwbk.fi/ws */
     backendWsUrl: string;
     authEnabled: boolean;
 }
@@ -28,8 +30,7 @@ export async function getConfig(): Promise<AppConfig> {
         if (response.ok) {
             const runtimeConfig = await response.json();
             cachedConfig = {
-                backendHttpUrl: runtimeConfig.VITE_BACKEND_HTTP_URL || getDefaultHttpUrl(),
-                backendWsUrl: runtimeConfig.VITE_BACKEND_WS_URL || getDefaultWsUrl(),
+                ...resolveBackendUrls(runtimeConfig.VITE_BACKEND_URL),
                 authEnabled: runtimeConfig.VITE_AUTH_ENABLED !== 'false',
             };
             console.log('Loaded runtime config:', cachedConfig);
@@ -41,8 +42,7 @@ export async function getConfig(): Promise<AppConfig> {
 
     // Fall back to Vite build-time env or defaults
     cachedConfig = {
-        backendHttpUrl: import.meta.env.VITE_BACKEND_HTTP_URL || getDefaultHttpUrl(),
-        backendWsUrl: import.meta.env.VITE_BACKEND_WS_URL || getDefaultWsUrl(),
+        ...resolveBackendUrls(import.meta.env.VITE_BACKEND_URL),
         authEnabled: import.meta.env.VITE_AUTH_ENABLED !== 'false',
     };
 
@@ -56,19 +56,25 @@ export async function getConfig(): Promise<AppConfig> {
 export function getConfigSync(): AppConfig {
     if (!cachedConfig) {
         // Return defaults if not initialized
-        return {
-            backendHttpUrl: getDefaultHttpUrl(),
-            backendWsUrl: getDefaultWsUrl(),
-            authEnabled: true,
-        };
+        return { ...resolveBackendUrls(undefined), authEnabled: true };
     }
     return cachedConfig;
 }
 
-function getDefaultHttpUrl(): string {
-    return `http://${window.location.hostname}:3001`;
+/**
+ * Derive both backend URLs from a single base URL (VITE_BACKEND_URL).
+ * HTTP: the base as given (trailing slash stripped). WS: same origin with http(s) -> ws(s), plus /ws.
+ * With no base configured, fall back to the page's host on port 3001, matching the page's scheme so an
+ * HTTPS deployment never attempts a mixed-content http:// or ws:// request (browsers block those outright).
+ */
+export function resolveBackendUrls(base: string | undefined): Pick<AppConfig, 'backendHttpUrl' | 'backendWsUrl'> {
+    const httpUrl = (base && base.trim()) || getDefaultBackendUrl();
+    const backendHttpUrl = httpUrl.replace(/\/+$/, '');
+    const backendWsUrl = `${backendHttpUrl.replace(/^http/i, 'ws')}/ws`;
+    return { backendHttpUrl, backendWsUrl };
 }
 
-function getDefaultWsUrl(): string {
-    return `ws://${window.location.hostname}:3001/ws`;
+function getDefaultBackendUrl(): string {
+    const scheme = window.location.protocol === 'https:' ? 'https' : 'http';
+    return `${scheme}://${window.location.hostname}:3001`;
 }

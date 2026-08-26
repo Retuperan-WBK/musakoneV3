@@ -5,9 +5,10 @@
  */
 
 // Runtime config from environment variables
+// VITE_BACKEND_URL is the backend base URL (e.g. https://mb.rwbk.fi); the client derives the
+// WebSocket URL from it. VITE_BACKEND_HTTP_URL is accepted as a legacy alias for existing deployments.
 const runtimeConfig = {
-    VITE_BACKEND_HTTP_URL: process.env.VITE_BACKEND_HTTP_URL || '',
-    VITE_BACKEND_WS_URL: process.env.VITE_BACKEND_WS_URL || '',
+    VITE_BACKEND_URL: process.env.VITE_BACKEND_URL || process.env.VITE_BACKEND_HTTP_URL || '',
     VITE_AUTH_ENABLED: process.env.VITE_AUTH_ENABLED || 'true',
 };
 
