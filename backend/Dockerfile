@@ -3,7 +3,9 @@
 # Stage 1: Build
 FROM ghcr.io/gleam-lang/gleam:v1.14.0-erlang-alpine AS builder
 
-WORKDIR /build
+# Build in the same path the runtime stage uses: the Gleam build cache records
+# absolute source paths, and `gleam run` re-validates them on start-up.
+WORKDIR /app
 
 # Install build dependencies
 RUN apk add --no-cache \
@@ -33,10 +35,10 @@ RUN apk add --no-cache \
     sqlite
 
 # Copy built application from builder
-COPY --from=builder /build/build /app/build
-COPY --from=builder /build/gleam.toml /app/
-COPY --from=builder /build/manifest.toml /app/
-COPY --from=builder /build/src /app/src
+COPY --from=builder /app/build /app/build
+COPY --from=builder /app/gleam.toml /app/
+COPY --from=builder /app/manifest.toml /app/
+COPY --from=builder /app/src /app/src
 
 # Create data directory for SQLite database
 RUN mkdir -p /app/data && \
