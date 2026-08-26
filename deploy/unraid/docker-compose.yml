@@ -1,10 +1,12 @@
+# Images are published by CI under the repository owner: ghcr.io/retuperan-wbk/musakone-*
+# (the repo moved from Pekeps to the Retuperan-WBK org; GITHUB_USER=pekeps no longer receives builds)
 # Unraid Deployment - Musakone
 # Place this file in /boot/config/plugins/compose.manager/projects/musakone/
 # Or run manually with: docker-compose up -d
 
 services:
   backend:
-    image: ghcr.io/${GITHUB_USER}/musakone-backend:latest
+    image: ghcr.io/${GITHUB_USER:-retuperan-wbk}/musakone-backend:latest
     container_name: musakone-backend
     ports:
       - "${BACKEND_PORT:-3001}:3001"
@@ -18,7 +20,7 @@ services:
       - "com.centurylinklabs.watchtower.enable=true"
 
   frontend:
-    image: ghcr.io/${GITHUB_USER}/musakone-frontend:latest
+    image: ghcr.io/${GITHUB_USER:-retuperan-wbk}/musakone-frontend:latest
     container_name: musakone-frontend
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
