@@ -69,8 +69,8 @@ const seed_artist_count = 5
 /// Tracks taken from each radio / discovery mix
 const mix_track_count = 40
 
-/// Tracks played inside this window are not suggested again (12 h)
-const recent_window_ms = 43_200_000
+/// Tracks played inside this window are not suggested again (48 h)
+const recent_window_ms = 172_800_000
 
 /// Users active inside this window shape the room profile (7 d)
 const active_window_ms = 604_800_000
@@ -111,11 +111,17 @@ pub fn recommend(
     artist_scores
     |> dict.to_list
     |> list.sort(fn(a, b) { float.compare(b.1, a.1) })
-    |> list.take(seed_artist_count)
-  let artist_max = case top_artists {
-    [#(_, s), ..] if s >. 0.0 -> s
-    _ -> 1.0
-  }
+    |> list.take(seed_artist_count * 2)
+    |> weighted_sample(seed_artist_count, fn(a) { a.1 })
+  let artist_max =
+    top_artists
+    |> list.fold(0.0, fn(m, a) { float.max(m, a.1) })
+    |> fn(m) {
+      case m >. 0.0 {
+        True -> m
+        False -> 1.0
+      }
+    }
 
   let candidates: Dict(String, Candidate) = dict.new()
 
@@ -253,8 +259,7 @@ pub fn recommend(
       }
       Candidate(..c, score: c.score *. bias, familiar: familiar)
     })
-    |> list.sort(fn(a, b) { float.compare(b.score, a.score) })
-    |> list.take(opts.limit * 3)
+    |> weighted_sample(opts.limit * 3, fn(c) { c.score })
 
   case ranked {
     [] -> Ok([])
@@ -266,6 +271,24 @@ pub fn recommend(
       |> Ok
     }
   }
+}
+
+/// Pick up to `count` items without replacement, each draw proportional to
+/// `weight`. Keeps strong items likely but lets the long tail through, so two
+/// runs with the same history give different music.
+pub fn weighted_sample(items: List(a), count: Int, weight: fn(a) -> Float) -> List(a) {
+  items
+  |> list.map(fn(item) {
+    // Efraimidis–Spirakis: key = u^(1/w), larger key wins
+    let w = float.max(weight(item), 0.000001)
+    let u = float.max(float.random(), 0.000001)
+    let log_u = float.logarithm(u) |> result.unwrap(-20.0)
+    let key = float.exponential(log_u /. w)
+    #(key, item)
+  })
+  |> list.sort(fn(a, b) { float.compare(b.0, a.0) })
+  |> list.take(count)
+  |> list.map(fn(p) { p.1 })
 }
 
 // ─── Seeds and taste profile ────────────────────────────────────────
