@@ -72,7 +72,10 @@ const mix_track_count = 40
 /// Tracks played inside this window are not suggested again (48 h)
 const recent_window_ms = 172_800_000
 
-/// Users active inside this window shape the room profile (7 d)
+/// Users who queued or searched inside this window are "here tonight" (3 h)
+const session_window_ms = 10_800_000
+
+/// Fallback when nobody is here tonight: users active inside this window (7 d)
 const active_window_ms = 604_800_000
 
 /// Cache lifetime for an artist's catalogue and mix contents (6 h)
@@ -298,7 +301,19 @@ fn seed_users(db: sqlight.Connection, scope: Scope, now: Int) -> List(#(Int, Flo
   case scope {
     ForUser(user_id) -> [#(user_id, 1.0)]
     ForRoom -> {
-      let active =
+      // Whoever is queuing/searching right now defines the room's taste;
+      // the past week only matters when nobody is around tonight
+      let tonight =
+        queries.get_active_users(db, now - session_window_ms)
+        |> result.unwrap([])
+        |> list.map(fn(u) {
+          let #(id, _name, last) = u
+          case now - last < 3_600_000 {
+            True -> #(id, 1.0)
+            False -> #(id, 0.6)
+          }
+        })
+      let this_week = fn() {
         queries.get_active_users(db, now - active_window_ms)
         |> result.unwrap([])
         |> list.map(fn(u) {
@@ -311,12 +326,14 @@ fn seed_users(db: sqlight.Connection, scope: Scope, now: Int) -> List(#(Int, Flo
           }
           #(id, weight)
         })
-      case active {
-        [] ->
+      }
+      case tonight, this_week() {
+        [_, ..], _ -> tonight
+        [], [_, ..] as week -> week
+        [], [] ->
           queries.get_users_with_affinity(db)
           |> result.unwrap([])
           |> list.map(fn(id) { #(id, 0.5) })
-        _ -> active
       }
     }
   }
