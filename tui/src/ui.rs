@@ -176,6 +176,7 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, uri: &str, rows: &[(String, S
                     ..inner
                 },
                 img,
+                app,
             );
         }
         Rect {
@@ -854,6 +855,7 @@ fn draw_browser(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
     let se = &app.se;
+    let cur_uri = app.current.as_ref().map(|c| c.track.uri.clone());
     // When the cursor is on a song and there's room, show a preview panel on the right
     // with that song's album art and full tags.
     let hovered = match se.cur() {
@@ -961,7 +963,28 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
                     bold: false,
                 }
             }
-            SeItem::Song(t) => Row::song_cols(t, cw, app.queue_uris.contains(&t.uri)),
+            SeItem::Song(t) => {
+                // ncmpcpp-style emphasis: playing = bright accent, queued = bright/bold,
+                // not queued = dimmed, so what's already in the queue stands out.
+                let in_q = app.queue_uris.contains(&t.uri);
+                let playing = cur_uri.as_deref() == Some(t.uri.as_str());
+                let mut spans = song_columns(t, cw);
+                if playing {
+                    for sp in &mut spans {
+                        sp.style = sp.style.fg(NOW);
+                    }
+                } else if !in_q {
+                    for sp in &mut spans {
+                        sp.style = sp.style.fg(Color::DarkGray);
+                    }
+                }
+                Row {
+                    spans,
+                    right: vec![],
+                    sep: false,
+                    bold: in_q || playing,
+                }
+            }
             SeItem::Artist(r) => Row::text(r.name.clone()),
             SeItem::Album(r) => Row::text(format!("[{}]", r.name)),
         },
@@ -978,7 +1001,7 @@ fn draw_search_preview(f: &mut Frame, area: Rect, app: &App, t: &Track) {
             ..area
         };
         match art_for(app, &t.uri) {
-            Some(Some(img)) => render_cover(f, art_area, img),
+            Some(Some(img)) => render_cover(f, art_area, img, app),
             Some(None) => f.render_widget(
                 Paragraph::new("\n(no album art)")
                     .alignment(ratatui::layout::Alignment::Center)
@@ -1252,18 +1275,64 @@ const ANSI16: [(u8, u8, u8); 16] = [
 // 4x4 Bayer matrix for ordered dithering (spreads quantisation error -> more apparent depth).
 const BAYER4: [[i32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
-/// Nearest ANSI-16 colour index, with ordered dithering by pixel position.
-fn quant16(p: [u8; 4], x: u32, y: u32) -> u8 {
-    let d = (BAYER4[(y & 3) as usize][(x & 3) as usize] as f32 / 16.0 - 0.5) * 64.0;
-    let ch = |c: u8| (c as f32 + d).clamp(0.0, 255.0) as i32;
-    let (r, g, b) = (ch(p[0]), ch(p[1]), ch(p[2]));
-    let mut best = 0u8;
-    let mut bestd = i32::MAX;
-    for (i, (pr, pg, pb)) in ANSI16.iter().enumerate() {
-        let dist = (r - *pr as i32).pow(2) + (g - *pg as i32).pow(2) + (b - *pb as i32).pow(2);
+/// One renderable cell on a 16-colour console: a glyph drawn in `fg` over `bg`.
+/// The glyph's ink coverage blends the two colours, so the set of (fg, bg, glyph)
+/// triples reaches far more apparent colours than the 16-entry palette alone.
+struct Cell16 {
+    fg: u8,
+    bg: u8,
+    glyph: &'static str,
+    rgb: (f32, f32, f32),
+}
+
+/// Glyphs the Linux console font actually has (verified on the clubroom VM:
+/// U+2588 full block and U+2591/U+2592 shades exist; the half-blocks do not),
+/// with their approximate ink coverage.
+const COVERAGE: [(f32, &str); 4] = [(0.0, " "), (0.25, "░"), (0.5, "▒"), (1.0, "█")];
+
+fn cells16() -> &'static [Cell16] {
+    static TABLE: std::sync::OnceLock<Vec<Cell16>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut v = Vec::with_capacity(8 * 16 * COVERAGE.len());
+        // Backgrounds: the console only honours the 8 dark colours for bg.
+        for bg in 0..8u8 {
+            let (br, bgc, bb) = ANSI16[bg as usize];
+            for fg in 0..16u8 {
+                let (fr, fgc, fb) = ANSI16[fg as usize];
+                for (cov, glyph) in COVERAGE {
+                    // Space ignores fg and full block ignores bg: only emit each once.
+                    if (cov == 0.0 && fg != 0) || (cov == 1.0 && bg != 0) {
+                        continue;
+                    }
+                    let mix = |b: u8, f: u8| b as f32 * (1.0 - cov) + f as f32 * cov;
+                    v.push(Cell16 {
+                        fg,
+                        bg,
+                        glyph,
+                        rgb: (mix(br, fr), mix(bgc, fgc), mix(bb, fb)),
+                    });
+                }
+            }
+        }
+        v
+    })
+}
+
+/// Best console cell for a pixel: ordered-dither the colour, then pick the blend
+/// nearest in a luma-weighted RGB distance.
+fn best_cell16(p: [u8; 4], x: u32, y: u32) -> &'static Cell16 {
+    let d = (BAYER4[(y & 3) as usize][(x & 3) as usize] as f32 / 16.0 - 0.5) * 24.0;
+    let r = (p[0] as f32 + d).clamp(0.0, 255.0);
+    let g = (p[1] as f32 + d).clamp(0.0, 255.0);
+    let b = (p[2] as f32 + d).clamp(0.0, 255.0);
+    let mut best = &cells16()[0];
+    let mut bestd = f32::MAX;
+    for c in cells16() {
+        let (dr, dg, db) = (r - c.rgb.0, g - c.rgb.1, b - c.rgb.2);
+        let dist = 2.0 * dr * dr + 4.0 * dg * dg + 3.0 * db * db;
         if dist < bestd {
             bestd = dist;
-            best = i as u8;
+            best = c;
         }
     }
     best
@@ -1271,6 +1340,8 @@ fn quant16(p: [u8; 4], x: u32, y: u32) -> u8 {
 
 #[derive(PartialEq)]
 enum ArtMode {
+    /// Real pixels straight into /dev/fb0 (Linux console with a writable framebuffer)
+    Fb,
     True,
     Ansi16,
     Ascii,
@@ -1282,28 +1353,79 @@ fn art_mode() -> ArtMode {
         Ok("0") => return ArtMode::True,
         _ => {}
     }
-    if truecolor() {
+    if crate::fb::get().is_some() {
+        ArtMode::Fb
+    } else if truecolor() {
         ArtMode::True
     } else {
-        // The Linux text console has 16 colours and the ▀ half-block; that beats mono ASCII.
+        // 16-colour console: blend fg/bg through the glyphs its font actually has.
         ArtMode::Ansi16
     }
 }
 
-fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage) {
+/// Framebuffer path: map the cell rect to screen pixels, scale the cover to fill a
+/// square inside it, record the blit, and leave the cells blank so text never lands
+/// on top of the image.
+fn render_cover_fb(f: &mut Frame, area: Rect, img: &image::DynamicImage, app: &App) {
+    let Some(fb) = crate::fb::get() else { return };
+    let term = f.area();
+    if term.width == 0 || term.height == 0 {
+        return;
+    }
+    // Pixel size of one character cell on this console (e.g. 8x16).
+    let cell_w = fb.width / term.width as u32;
+    let cell_h = fb.height / term.height as u32;
+    if cell_w == 0 || cell_h == 0 {
+        return;
+    }
+    // Largest square (in pixels) that fits the cell rect.
+    let avail_w = area.width as u32 * cell_w;
+    let avail_h = area.height as u32 * cell_h;
+    let side = avail_w.min(avail_h);
+    if side < 4 {
+        return;
+    }
+    let x = area.x as u32 * cell_w + (avail_w - side) / 2;
+    let y = area.y as u32 * cell_h + (avail_h - side) / 2;
+    let scaled = img
+        .resize_exact(side, side, image::imageops::FilterType::Triangle)
+        .to_rgb8();
+    *app.fb_blit.borrow_mut() = Some(crate::fb::Blit {
+        x,
+        y,
+        w: side,
+        h: side,
+        rgb: scaled.into_raw(),
+    });
+    // Blank the cells under the image (default black bg) so the text layer is empty there.
+    let blank: Vec<Line> = (0..area.height)
+        .map(|_| Line::raw(" ".repeat(area.width as usize)))
+        .collect();
+    f.render_widget(Paragraph::new(blank), area);
+}
+
+fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage, app: &App) {
     use image::GenericImageView;
     if area.width < 2 || area.height < 1 {
         return;
     }
     let mode = art_mode();
-    let ascii = mode == ArtMode::Ascii;
-    // A cell is ~twice as tall as wide. Half-block modes stack two pixels per cell
-    // (cols = 2*rows); ASCII uses one pixel per cell but samples the same square.
+    if mode == ArtMode::Fb {
+        return render_cover_fb(f, area, img, app);
+    }
+    // A cell is ~twice as tall as wide. Truecolor stacks two pixels per cell with a
+    // half-block (cols = 2*rows, sample a square). The 16-colour and ASCII modes draw
+    // one pixel per cell, so they sample cols x rows: a 2:1 image that the 1:2 cell
+    // aspect stretches back into a square on screen.
     let rows = (area.height as u32).min(area.width as u32 / 2).max(1);
     let cols = rows * 2;
     let scaled = img.resize_exact(
         cols,
-        if ascii { rows } else { rows * 2 },
+        if mode == ArtMode::True {
+            rows * 2
+        } else {
+            rows
+        },
         image::imageops::FilterType::Triangle,
     );
     let (cols_u, rows_u) = (cols as u16, rows as u16);
@@ -1314,6 +1436,8 @@ fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage) {
         let mut spans = Vec::with_capacity(cols as usize);
         for cx in 0..cols {
             match mode {
+                // Fb returned early above; the text layer never reaches here.
+                ArtMode::Fb => unreachable!("framebuffer mode handled by render_cover_fb"),
                 ArtMode::True => {
                     let top = scaled.get_pixel(cx, ry * 2).0;
                     let bot = scaled.get_pixel(cx, ry * 2 + 1).0;
@@ -1325,13 +1449,12 @@ fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage) {
                     ));
                 }
                 ArtMode::Ansi16 => {
-                    let top = quant16(scaled.get_pixel(cx, ry * 2).0, cx, ry * 2);
-                    let bot = quant16(scaled.get_pixel(cx, ry * 2 + 1).0, cx, ry * 2 + 1);
+                    let c = best_cell16(scaled.get_pixel(cx, ry).0, cx, ry);
                     spans.push(Span::styled(
-                        "▀",
+                        c.glyph,
                         Style::default()
-                            .fg(Color::Indexed(top))
-                            .bg(Color::Indexed(bot)),
+                            .fg(Color::Indexed(c.fg))
+                            .bg(Color::Indexed(c.bg)),
                     ));
                 }
                 ArtMode::Ascii => {

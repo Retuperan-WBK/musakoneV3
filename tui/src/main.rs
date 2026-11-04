@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod fb;
 mod model;
 mod rpc;
 mod ui;
@@ -140,6 +141,13 @@ async fn main() -> Result<()> {
     loop {
         if dirty {
             terminal.draw(|f| ui::draw(f, &mut app))?;
+            // Framebuffer art must land after ratatui has flushed the text layer,
+            // otherwise the blank cells underneath would paint over it.
+            if let Some(b) = app.fb_blit.borrow_mut().take() {
+                if let Some(fb) = fb::get() {
+                    fb.blit(&b);
+                }
+            }
             dirty = false;
         }
         tokio::select! {
