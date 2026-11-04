@@ -60,7 +60,10 @@ pub fn start() -> Result(Subject(BusMessage), actor.StartError) {
 import gleam/result
 
 /// Handle incoming messages
-fn handle_message(state: State, message: BusMessage) -> actor.Next(State, BusMessage) {
+fn handle_message(
+  state: State,
+  message: BusMessage,
+) -> actor.Next(State, BusMessage) {
   case message {
     Subscribe(subscriber) -> {
       logging.log(logging.Debug, "Event bus: new subscriber registered")

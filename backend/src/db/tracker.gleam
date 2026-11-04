@@ -112,6 +112,18 @@ pub fn record_request(ctx: PlaybackContext, raw: String) -> PlaybackContext {
   }
 }
 
+/// True for events (no "id") and for replies to a request this connection sent.
+pub fn owns_response(ctx: PlaybackContext, raw: String) -> Bool {
+  let id_decoder = {
+    use id <- decode.field("id", decode.int)
+    decode.success(id)
+  }
+  case json.parse(raw, id_decoder) {
+    Ok(id) -> dict.has_key(ctx.pending_requests, id)
+    Error(_) -> True
+  }
+}
+
 /// Update context from a Mopidy message flowing through.
 /// Handles both events (has "event" field) and JSON-RPC responses
 /// (has "id" + "result" — correlated to the original request method).
@@ -665,7 +677,8 @@ fn handle_command(
       case track_uris, from_rel, to_rel {
         Some(uri), Some(from_d), Some(to_d) -> {
           // Moved closer if absolute distance decreased
-          let moved_closer = int.absolute_value(to_d) < int.absolute_value(from_d)
+          let moved_closer =
+            int.absolute_value(to_d) < int.absolute_value(from_d)
           case moved_closer {
             True -> {
               let _ =
@@ -1228,10 +1241,7 @@ fn extract_tl_track_info(raw: String) -> TrackInfo {
     |> result.map(Some)
     |> result.unwrap(None)
   let track_no =
-    json.parse(
-      raw,
-      decode.at(["tl_track", "track", "track_no"], decode.int),
-    )
+    json.parse(raw, decode.at(["tl_track", "track", "track_no"], decode.int))
     |> result.map(Some)
     |> result.unwrap(None)
   let disc_no =

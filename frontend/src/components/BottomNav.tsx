@@ -1,4 +1,4 @@
-import { Library, List, ListMusic, Search, Sparkles } from 'lucide-preact';
+import { Library, List, ListMusic, Search } from 'lucide-preact';
 import { useLocation } from 'wouter';
 
 export function BottomNav() {
@@ -9,7 +9,6 @@ export function BottomNav() {
         { path: '/library', icon: Library, label: 'Library' },
         { path: '/search', icon: Search, label: 'Search' },
         { path: '/playlists', icon: ListMusic, label: 'Playlists' },
-        { path: '/mix', icon: Sparkles, label: 'Mix' },
     ];
 
     return (

@@ -10,7 +10,8 @@ A lightweight, mobile-first web frontend for Mopidy music server with a terminal
 - 🔄 **Real-time Updates**: WebSocket integration for live playback status
 - 📱 **PWA Support**: Install on mobile home screen
 - 🎹 **Full Control**: Playback, queue management (drag to reorder), library browsing, and search
-- ✨ **Mix**: Recommendations from the room's listening history + Tidal discovery, autoplay that keeps the queue from running dry, and listening stats
+- 📋 **Shared playlists**: Everyone sees every playlist with its creator; you edit your own
+- 💻 **Terminal client**: `tui/` — an ncmpcpp-style TUI on the same backend
 - 🐳 **Docker Ready**: Easy deployment with Docker Compose
 
 ## Architecture

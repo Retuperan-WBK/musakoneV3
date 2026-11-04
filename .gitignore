@@ -126,4 +126,5 @@ mopidy-data/
 .env.*.local
 
 # Docker volumes
-docker-compose.override.yml
+docker-compose.override.yml# Rust
+tui/target/

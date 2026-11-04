@@ -110,9 +110,10 @@ export interface UserStats {
 export interface Playlist {
     id: number;
     user_id: number;
+    /** Owner's username; every playlist is visible to the whole room */
+    username: string;
     name: string;
     description: string | null;
-    is_public: boolean;
     created_at: number;
     updated_at: number;
 }

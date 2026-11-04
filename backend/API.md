@@ -106,57 +106,19 @@ Public "now playing" snapshot (no auth): state, track, position, volume, `queue_
 ### `GET /api/playback/history?limit=50`
 Recent Mopidy state transitions with attribution (`user_id` when a person caused it).
 
-## Mix: recommendations, autoplay, insights
+## Playlists
 
-### `GET /api/recommendations?scope=me|room&limit=20`
-Tracks to play next, built from listening history and Mopidy/Tidal discovery
-(artist top tracks, "<Artist> (Artist Radio)" mixes, the account's Daily Discovery).
-`scope=me` serves the caller's taste, `scope=room` blends everyone active in the last 7 days.
-Tracks currently queued, played in the last 12 h, or disliked are never suggested.
+All playlists are shared with the whole room: everyone can list and read them, only the
+owner can change them. Every playlist object carries `user_id` and `username` (the owner).
+Endpoints require `Authorization: Bearer <token>`.
 
-```json
-{
-  "scope": "room",
-  "generated_at": 1787688541358,
-  "items": [
-    {
-      "uri": "tidal:track:…",
-      "name": "One of These Nights",
-      "artist": "Eagles",
-      "album": "One of These Nights",
-      "duration_ms": 291000,
-      "score": 1.12,
-      "reasons": ["Sounds like Korelon", "Daily discovery"]
-    }
-  ]
-}
-```
-
-First call for a new set of seed artists can take several seconds (Tidal browsing);
-results are cached in `rpc_cache` for 6 h.
-
-### `GET /api/autoplay`
-```json
-{ "settings": { "enabled": false, "min_ahead": 2, "batch_size": 5, "discovery": 0.5, "mode": "room" }, "added_24h": 0 }
-```
-
-### `PUT /api/autoplay`
-Partial update of the same settings object. `mode` is `"room"` or `"user:<id>"`,
-`discovery` is 0.0–1.0 (favourites → new music), `min_ahead` 0–20, `batch_size` 1–20.
-When enabled, the autoplay actor appends `batch_size` recommended tracks whenever fewer
-than `min_ahead` tracks remain after the current one, and restarts playback if the queue
-had run dry. Additions are logged as `queue_events` under the `autoplay` system user and
-announced to browsers as a `{"event":"autoplay_added","count":n,"tracks":[…]}` frame.
-
-### `POST /api/autoplay/fill`
-Add a batch right now regardless of the threshold. Returns `{ "added": n }`, or 409 with
-an `error` when nothing could be recommended (e.g. no listening history yet).
-
-### `GET /api/insights`
-Everything the Mix → Stats page shows: `now_playing`, `autoplay`, `room` (totals, top
-tracks/artists, per-user taste map, plays by UTC hour for 7 d, plays per day for 14 d,
-active users, recent queue adds with usernames, recent plays) and `me` (top artists/tracks,
-counts, minutes listened).
+- `GET /api/playlists` — every playlist, newest activity first
+- `POST /api/playlists` — `{ "name", "description" }` creates one owned by the caller (201)
+- `GET /api/playlists/:id` — `{ "playlist", "tracks": [{ "track_uri", "position" }] }`
+- `PUT /api/playlists/:id`, `DELETE /api/playlists/:id` — owner only (403 otherwise)
+- `POST /api/playlists/:id/tracks` `{ "track_uri" }`, `POST /api/playlists/:id/tracks/remove`
+  `{ "track_uri" }`, `PUT /api/playlists/:id/tracks/reorder` `{ "track_uri", "new_position" }` — owner only
+- `GET /api/playlists/containing?track_uri=…` — ids of the caller's playlists holding the track
 
 ## WebSocket
 
