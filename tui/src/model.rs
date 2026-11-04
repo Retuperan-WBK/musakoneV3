@@ -75,26 +75,6 @@ impl Track {
         }
     }
 
-    /// `{{%a{ "%b"{ (%y)}} - }{%t}}|{%f}` (song_status_format).
-    pub fn status(&self) -> String {
-        if self.name.is_empty() {
-            return self.filename();
-        }
-        let mut s = String::new();
-        if !self.artists.is_empty() {
-            s.push_str(&self.artists);
-            if !self.album.is_empty() {
-                s.push_str(&format!(" \"{}\"", self.album));
-                if !self.date.is_empty() {
-                    s.push_str(&format!(" ({})", self.date));
-                }
-            }
-            s.push_str(" - ");
-        }
-        s.push_str(&self.name);
-        s
-    }
-
     /// `{%n - }{%t}|{%f}` (song_library_format).
     pub fn library(&self) -> String {
         if self.name.is_empty() {
@@ -228,10 +208,6 @@ mod tests {
         let t = TlTrack::from_value(&v).unwrap();
         assert_eq!(t.tlid, 7);
         assert_eq!(t.track.classic(), "Retuperän WBK - Kaipaus");
-        assert_eq!(
-            t.track.status(),
-            "Retuperän WBK \"Valioita\" (1999) - Kaipaus"
-        );
         assert_eq!(t.track.library(), "3 - Kaipaus");
         assert_eq!(t.track.duration(), "2:36");
         assert_eq!(fmt_ms(3_723_000), "1:02:03");
