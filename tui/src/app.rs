@@ -307,6 +307,8 @@ pub struct App {
     pub random: bool,
     pub single: bool,
     pub consume: bool,
+    /// Whether the playback modes have been loaded once (to stay quiet on startup)
+    options_known: bool,
     ticks: u64,
     last_seek: Instant,
     seek_step: i64,
@@ -359,7 +361,7 @@ pub struct App {
     pub title_scroll: usize,
 }
 
-const VOL_STEP: i64 = 2;
+const VOL_STEP: i64 = 1; // ncmpcpp volume_change_step = 1
 const HIGHLIGHT_DELAY: Duration = Duration::from_secs(5);
 
 impl App {
@@ -397,6 +399,7 @@ impl App {
             random: false,
             single: false,
             consume: false,
+            options_known: false,
             ticks: 0,
             last_seek: Instant::now(),
             seek_step: 1,
@@ -519,6 +522,11 @@ impl App {
                 Ok(Msg::Tracks(flatten_lookup(&v)))
             });
         }
+    }
+
+    /// Toggle a playback mode and announce the new state, like ncmpcpp's statusbar.
+    fn toggle_mode(&mut self, method: &'static str, _name: &str, current: bool) {
+        self.rpc_fire(method, json!({ "value": !current }));
     }
 
     fn rpc_fire(&self, method: &'static str, params: Value) {
@@ -1343,6 +1351,21 @@ impl App {
                 self.title_scroll = 0;
             }
             Msg::Options(r, z, y, c) => {
+                // Announce each mode that changed, whoever changed it (us or another
+                // client), like ncmpcpp. Silent on the first load so startup is quiet.
+                if self.options_known {
+                    for (old, new, name) in [
+                        (self.repeat, r, "Repeat"),
+                        (self.random, z, "Random"),
+                        (self.single, y, "Single"),
+                        (self.consume, c, "Consume"),
+                    ] {
+                        if old != new {
+                            self.say(format!("{name} mode is {}", if new { "on" } else { "off" }));
+                        }
+                    }
+                }
+                self.options_known = true;
                 self.repeat = r;
                 self.random = z;
                 self.single = y;
@@ -1493,19 +1516,10 @@ impl App {
             K::Left if columns => self.next_column(-1),
             K::Right | K::Char('+') => self.set_volume(self.volume + VOL_STEP),
             K::Left | K::Char('-') => self.set_volume(self.volume - VOL_STEP),
-            K::Char('r') => {
-                self.rpc_fire("core.tracklist.set_repeat", json!({"value": !self.repeat}))
-            }
-            K::Char('z') => {
-                self.rpc_fire("core.tracklist.set_random", json!({"value": !self.random}))
-            }
-            K::Char('y') => {
-                self.rpc_fire("core.tracklist.set_single", json!({"value": !self.single}))
-            }
-            K::Char('R') => self.rpc_fire(
-                "core.tracklist.set_consume",
-                json!({"value": !self.consume}),
-            ),
+            K::Char('r') => self.toggle_mode("core.tracklist.set_repeat", "Repeat", self.repeat),
+            K::Char('z') => self.toggle_mode("core.tracklist.set_random", "Random", self.random),
+            K::Char('y') => self.toggle_mode("core.tracklist.set_single", "Single", self.single),
+            K::Char('R') => self.toggle_mode("core.tracklist.set_consume", "Consume", self.consume),
             K::Char('Z') => {
                 self.rpc_fire("core.tracklist.shuffle", json!({}));
                 self.say("Playlist shuffled");
@@ -2016,14 +2030,22 @@ impl App {
                 );
             }
             K::Char('m') if i > 0 => {
-                self.queue.cursor -= 1;
+                // Reorder optimistically so the cursor follows the moved song; the
+                // tracklist_changed reload then confirms by tlid.
+                self.queue.items.swap(i, i - 1);
+                self.queue.sel.swap(i, i - 1);
+                self.queue.cursor = i - 1;
+                self.queue.fix_offset();
                 self.rpc_fire(
                     "core.tracklist.move",
                     json!({"start": i, "end": i + 1, "to_position": i - 1}),
                 );
             }
             K::Char('n') if i + 1 < self.queue.len() => {
-                self.queue.cursor += 1;
+                self.queue.items.swap(i, i + 1);
+                self.queue.sel.swap(i, i + 1);
+                self.queue.cursor = i + 1;
+                self.queue.fix_offset();
                 self.rpc_fire(
                     "core.tracklist.move",
                     json!({"start": i, "end": i + 1, "to_position": i + 1}),

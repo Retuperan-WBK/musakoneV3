@@ -11,11 +11,13 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const MAIN: Color = Color::Yellow; // main_window_color
-const EMPTY_TAG: Color = Color::Cyan; // empty_tag_color
+const MAIN: Color = Color::Red; // main_window_color = red
+const EMPTY_TAG: Color = Color::Red; // empty_tag_color = red
 const SELECTED: Color = Color::Magenta; // selected_item_prefix $6
 const PROGRESS: Color = Color::DarkGray; // progressbar_color black:b
-const PROGRESS_ELAPSED: Color = Color::Green; // progressbar_elapsed_color green:b
+const PROGRESS_ELAPSED: Color = Color::Green; // progressbar_elapsed_color
+const STATUSBAR: Color = Color::Yellow; // statusbar_color = yellow
+const STATE_LINE: Color = Color::Red; // state_line_color = red
 
 struct Row<'a> {
     spans: Vec<Span<'a>>,
@@ -39,6 +41,14 @@ impl<'a> Row<'a> {
             right: vec![],
             sep: true,
             bold: false,
+        }
+    }
+    fn song_cols(t: &Track, width: usize, in_queue: bool) -> Row<'a> {
+        Row {
+            spans: song_columns(t, width),
+            right: vec![],
+            sep: false,
+            bold: in_queue,
         }
     }
     fn song(t: &Track, in_queue: bool) -> Row<'a> {
@@ -71,41 +81,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
     let w = area.width;
-    let header = Rect {
+    // ncmpcpp "alternative" user interface: a two-line now-playing header on top,
+    // a divider carrying the screen name, the body, then progress bar + status.
+    let row = |y: u16| Rect {
         x: 0,
-        y: 0,
+        y,
         width: w,
         height: 1,
     };
-    let state_line = Rect {
-        x: 0,
-        y: 1,
-        width: w,
-        height: 1,
-    };
+    let np0 = row(0);
+    let np1 = row(1);
+    let divider = row(2);
     let main = Rect {
         x: 0,
-        y: 2,
+        y: 3,
         width: w,
-        height: area.height - 4,
+        height: area.height - 5,
     };
-    let bar = Rect {
-        x: 0,
-        y: area.height - 2,
-        width: w,
-        height: 1,
-    };
-    let status = Rect {
-        x: 0,
-        y: area.height - 1,
-        width: w,
-        height: 1,
-    };
+    let bar = row(area.height - 2);
+    let status = row(area.height - 1);
 
     // Menus need their window height before scrolling can be resolved.
     size_menus(app, main);
 
-    draw_header(f, header, state_line, app);
+    draw_alt_header(f, np0, np1, divider, app);
     match app.screen {
         Screen::Help => draw_help(f, main, app),
         Screen::Playlist => draw_playlist(f, main, app),
@@ -126,7 +125,7 @@ fn size_menus(app: &mut App, main: Rect) {
     let h = main.height as usize;
     app.queue.height = h.saturating_sub(2).max(1); // column titles take two rows
     app.queue.fix_offset();
-    app.browser.height = h;
+    app.browser.height = h.saturating_sub(2).max(1); // column header + separator
     app.browser.fix_offset();
     app.se.height = h;
     app.se.fix_offset();
@@ -168,14 +167,12 @@ fn scroller(text: &str, width: usize, begin: usize) -> String {
     out
 }
 
-fn volume_state(app: &App) -> String {
-    format!(" Volume: {}%", app.volume)
+fn volume_state(_app: &App) -> String {
+    format!(" Vol: {}%", _app.volume)
 }
 
-fn draw_header(f: &mut Frame, header: Rect, state_line: Rect, app: &App) {
-    let vol = volume_state(app);
-    let avail = (header.width as usize).saturating_sub(vol.width());
-    let title = match app.screen {
+fn screen_title(app: &App, avail: usize) -> String {
+    match app.screen {
         Screen::Help => "Help".to_string(),
         Screen::Playlist => {
             let n = app.queue.len();
@@ -185,8 +182,8 @@ fn draw_header(f: &mut Frame, header: Rect, state_line: Rect, app: &App) {
             }
             stats.push(')');
             format!(
-                "Playlist {}",
-                scroller(&stats, avail.saturating_sub(9), app.title_scroll)
+                "Playlist  {}",
+                scroller(&stats, avail.saturating_sub(10), app.title_scroll)
             )
         }
         Screen::Browser => format!(
@@ -200,18 +197,131 @@ fn draw_header(f: &mut Frame, header: Rect, state_line: Rect, app: &App) {
         Screen::Search => "Search engine".into(),
         Screen::Library => "Media library".into(),
         Screen::Editor => "Playlist editor".into(),
-        Screen::Lyrics => match &app.current {
-            Some(c) => format!(
-                "Lyrics: {}",
-                scroller(
-                    &c.track.classic(),
-                    avail.saturating_sub(8),
-                    app.title_scroll
-                )
-            ),
-            None => "Lyrics".into(),
-        },
+        Screen::Lyrics => "Lyrics".into(),
+    }
+}
+
+/// Place left / centered / right segments on a single row.
+fn place(f: &mut Frame, r: Rect, left: Line, center: Line, right: Line) {
+    let w = r.width as usize;
+    let lw = left.width();
+    let rw = right.width();
+    let cw = center.width();
+    if rw > 0 {
+        f.render_widget(
+            Paragraph::new(right).right_aligned(),
+            Rect {
+                x: r.x + r.width - rw as u16,
+                width: rw as u16,
+                ..r
+            },
+        );
+    }
+    if lw > 0 {
+        f.render_widget(
+            Paragraph::new(left),
+            Rect {
+                width: lw as u16,
+                ..r
+            },
+        );
+    }
+    if cw > 0 && cw <= w {
+        let start = ((w - cw) / 2)
+            .max(lw + 1)
+            .min(w.saturating_sub(rw + 1 + cw));
+        f.render_widget(
+            Paragraph::new(center),
+            Rect {
+                x: r.x + start as u16,
+                width: cw as u16,
+                ..r
+            },
+        );
+    }
+}
+
+/// Alternative-UI header: two now-playing lines plus a divider carrying the screen name.
+fn draw_alt_header(f: &mut Frame, np0: Rect, np1: Rect, divider: Rect, app: &App) {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let w = divider.width as usize;
+
+    // Row 0: [elapsed/total]  <title>  Vol: X%
+    let (time, title): (Line, Line) = match &app.current {
+        Some(c) => {
+            let t = match c.track.length {
+                Some(l) => format!("{}/{}", fmt_ms(app.elapsed_ms().min(l)), fmt_ms(l)),
+                None => fmt_ms(app.elapsed_ms()),
+            };
+            let name = if c.track.name.is_empty() {
+                c.track.filename()
+            } else {
+                c.track.name.clone()
+            };
+            (
+                Line::styled(t, bold),
+                Line::styled(scroller(&name, w / 2, app.title_scroll), bold),
+            )
+        }
+        None => (Line::raw(""), Line::raw("")),
     };
+    let vol = volume_state(app);
+    place(f, np0, time, title, Line::raw(vol));
+
+    // Row 1: [state]  <artist - album (year)>  [flags]
+    let state = match app.state {
+        PlayState::Playing => "[playing]",
+        PlayState::Paused => "[paused]",
+        PlayState::Stopped => "[stopped]",
+    };
+    let mid: Line = match &app.current {
+        Some(c) if !c.track.artists.is_empty() => {
+            let mut spans = vec![Span::styled(
+                c.track.artists.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            if !c.track.album.is_empty() {
+                spans.push(Span::raw(" - "));
+                spans.push(Span::styled(
+                    c.track.album.clone(),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            if !c.track.date.is_empty() {
+                spans.push(Span::styled(
+                    format!(" ({})", c.track.date),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Line::from(spans)
+        }
+        _ => Line::raw(""),
+    };
+    // flags: all six ncmpcpp slots, '-' when off. Mopidy has no crossfade/db-update,
+    // so those two stay '-' (matches ncmpcpp's [r-----] width against this server).
+    let mut fl = String::from("[");
+    for (on, c) in [
+        (app.repeat, 'r'),
+        (app.random, 'z'),
+        (app.single, 'y'),
+        (app.consume, 'R'),
+        (false, 'x'),
+        (false, 'U'),
+    ] {
+        fl.push(if on { c } else { '-' });
+    }
+    fl.push(']');
+    place(
+        f,
+        np1,
+        Line::styled(state.to_string(), bold),
+        mid,
+        Line::raw(fl),
+    );
+
+    // Divider: screen name (bold) then a red rule; append connection trouble in red.
     let conn = if !app.connected {
         "  [disconnected]"
     } else if !app.mopidy_ok {
@@ -219,51 +329,19 @@ fn draw_header(f: &mut Frame, header: Rect, state_line: Rect, app: &App) {
     } else {
         ""
     };
+    let name = screen_title(app, w.saturating_sub(4));
+    let used = name.width() + conn.width();
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(name, bold.fg(MAIN)),
             Span::styled(conn, Style::default().fg(Color::Red)),
+            Span::styled(
+                format!(" {}", "─".repeat(w.saturating_sub(used + 1))),
+                Style::default().fg(STATE_LINE),
+            ),
         ])),
-        Rect {
-            width: avail as u16,
-            ..header
-        },
+        divider,
     );
-    f.render_widget(
-        Paragraph::new(vol),
-        Rect {
-            x: header.x + avail as u16,
-            width: header.width - avail as u16,
-            ..header
-        },
-    );
-
-    // State line: horizontal line with [flags] near the right edge (flags bold).
-    let mut flags = String::new();
-    for (on, c) in [
-        (app.repeat, 'r'),
-        (app.random, 'z'),
-        (app.single, 'y'),
-        (app.consume, 'R'),
-    ] {
-        if on {
-            flags.push(c);
-        }
-    }
-    let w = state_line.width as usize;
-    if flags.is_empty() {
-        f.render_widget(Paragraph::new("─".repeat(w)), state_line);
-    } else {
-        let x = w.saturating_sub(flags.len() + 3);
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw(format!("{}[", "─".repeat(x))),
-                Span::styled(flags.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("]─"),
-            ])),
-            state_line,
-        );
-    }
 }
 
 fn draw_progress(f: &mut Frame, area: Rect, app: &App) {
@@ -323,43 +401,14 @@ fn draw_statusbar(f: &mut Frame, area: Rect, app: &App) {
         f.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
         return;
     }
+    // Alternative UI keeps the now-playing line in the header; the statusbar is
+    // only for messages (statusbar_color = yellow).
     if let Some((m, _)) = &app.message {
-        return f.render_widget(Paragraph::new(m.as_str()), area);
+        f.render_widget(
+            Paragraph::new(m.as_str()).style(Style::default().fg(STATUSBAR)),
+            area,
+        );
     }
-    let Some(cur) = &app.current else { return };
-    let ps = match app.state {
-        PlayState::Playing => "Playing:",
-        PlayState::Paused => "Paused:",
-        PlayState::Stopped => return,
-    };
-    let time = match cur.track.length {
-        Some(l) => format!("[{}/{}]", fmt_ms(app.elapsed_ms().min(l)), fmt_ms(l)),
-        None => format!("[{}]", fmt_ms(app.elapsed_ms())),
-    };
-    let avail = (area.width as usize).saturating_sub(ps.len() + time.len() + 2);
-    let song = scroller(&cur.track.status(), avail, app.status_scroll);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(ps, Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" "),
-            Span::raw(song),
-        ])),
-        Rect {
-            width: area.width - time.len() as u16,
-            ..area
-        },
-    );
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            time.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Rect {
-            x: area.x + area.width - time.len() as u16,
-            width: time.len() as u16,
-            ..area
-        },
-    );
 }
 
 // ---------- generic menu ----------
@@ -669,19 +718,22 @@ fn draw_playlist(f: &mut Frame, area: Rect, app: &App) {
 // ---------- browser ----------
 
 fn draw_browser(f: &mut Frame, area: Rect, app: &App) {
+    // browser_display_mode = columns
+    let body = titled(f, area, &columns_header(area.width as usize));
     let b = &app.browser;
     if b.is_empty() {
         if app.browse_loading {
             f.render_widget(
                 Paragraph::new("Loading...").style(Style::default().fg(MAIN)),
-                area,
+                body,
             );
         }
         return;
     }
+    let cw = body.width as usize;
     draw_menu(
         f,
-        area,
+        body,
         b.len(),
         b.offset,
         b.cursor,
@@ -691,7 +743,7 @@ fn draw_browser(f: &mut Frame, area: Rect, app: &App) {
             let r = &b.items[i];
             if r.is_track() {
                 match app.track_of(&r.uri) {
-                    Some(t) => Row::song(t, app.queue_uris.contains(&r.uri)),
+                    Some(t) => Row::song_cols(t, cw, app.queue_uris.contains(&r.uri)),
                     None => Row {
                         spans: vec![Span::raw(r.name.clone())],
                         right: vec![],
@@ -721,6 +773,8 @@ fn draw_browser(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
     let se = &app.se;
+    // search_engine_display_mode = columns (song results align like the playlist)
+    let cw = area.width as usize;
     let bold = Style::default().add_modifier(Modifier::BOLD);
     draw_menu(
         f,
@@ -800,7 +854,7 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
                     bold: false,
                 }
             }
-            SeItem::Song(t) => Row::song(t, app.queue_uris.contains(&t.uri)),
+            SeItem::Song(t) => Row::song_cols(t, cw, app.queue_uris.contains(&t.uri)),
             SeItem::Artist(r) => Row::text(r.name.clone()),
             SeItem::Album(r) => Row::text(format!("[{}]", r.name)),
         },
