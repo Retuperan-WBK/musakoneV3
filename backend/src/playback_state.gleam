@@ -76,6 +76,10 @@ type State {
     context: tracker.PlaybackContext,
     pending_attributions: List(PendingAttribution),
     last_volume_log_ms: Int,
+    /// Last volume level written to the log (Mopidy re-announces the same level every few minutes)
+    last_volume_level: Option(Int),
+    /// Last tracklist_changed written to the log (bulk adds emit one event per track)
+    last_tracklist_log_ms: Int,
     /// Reserved request ID counter for our own Mopidy queries
     next_request_id: Int,
     /// Active listening sessions per user (user_id -> session)
@@ -87,6 +91,9 @@ type State {
 
 /// Minimum time between volume log entries (ms) to avoid slider-drag floods
 const volume_debounce_ms = 1000
+
+/// Minimum time between tracklist_changed log entries (ms): a bulk add is one change
+const tracklist_debounce_ms = 5000
 
 /// TTL for pending attributions (ms) — commands older than this won't match
 const attribution_ttl_ms = 2000
@@ -116,6 +123,8 @@ pub fn start(
       context: tracker.empty_context(),
       pending_attributions: [],
       last_volume_log_ms: 0,
+      last_volume_level: None,
+      last_tracklist_log_ms: 0,
       next_request_id: base_request_id,
       active_sessions: dict.new(),
     )
@@ -291,11 +300,18 @@ fn process_state_change(state: State, raw: String) -> State {
       case etype == "volume" {
         True -> {
           let now = now_ms()
-          case now - state.last_volume_log_ms < volume_debounce_ms {
+          let unchanged = state.context.volume == state.last_volume_level
+          case
+            unchanged || now - state.last_volume_log_ms < volume_debounce_ms
+          {
             True -> prune_attributions(state)
             False -> {
               let state = log_state_change(state, etype)
-              State(..state, last_volume_log_ms: now)
+              State(
+                ..state,
+                last_volume_log_ms: now,
+                last_volume_level: state.context.volume,
+              )
             }
           }
         }
@@ -315,7 +331,14 @@ fn process_state_change(state: State, raw: String) -> State {
                   context: tracker.record_request(state.context, msg),
                   next_request_id: id + 1,
                 )
-              log_state_change(state, etype)
+              let now = now_ms()
+              case now - state.last_tracklist_log_ms < tracklist_debounce_ms {
+                True -> prune_attributions(state)
+                False -> {
+                  let state = log_state_change(state, etype)
+                  State(..state, last_tracklist_log_ms: now)
+                }
+              }
             }
             False -> log_state_change(state, etype)
           }

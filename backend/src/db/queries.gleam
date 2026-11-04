@@ -422,6 +422,23 @@ pub fn log_search_event(
   |> result.map(fn(_) { Nil })
 }
 
+/// Fill result_count on the user's most recent search (the reply arrives after the request row)
+pub fn set_last_search_result_count(
+  db: sqlight.Connection,
+  user_id: Int,
+  count: Int,
+) -> Result(Nil, sqlight.Error) {
+  sqlight.query(
+    "UPDATE search_events SET result_count = ?
+     WHERE id = (SELECT max(id) FROM search_events WHERE user_id = ? AND event_type = 'search')
+       AND result_count IS NULL",
+    db,
+    [sqlight.int(count), sqlight.int(user_id)],
+    decode.dynamic,
+  )
+  |> result.map(fn(_) { Nil })
+}
+
 /// Get search events for a user
 pub fn get_search_events(
   db: sqlight.Connection,
@@ -1482,13 +1499,15 @@ pub fn log_search_conversion(
   timestamp_ms: Int,
   query_text: Option(String),
   result_uri: Option(String),
+  result_position: Option(Int),
+  uri_count: Int,
   action: String,
   time_to_action_ms: Option(Int),
 ) -> Result(Nil, sqlight.Error) {
   let sql =
     "INSERT INTO search_conversions
-     (user_id, timestamp_ms, query_text, result_uri, action, time_to_action_ms)
-     VALUES (?, ?, ?, ?, ?, ?)"
+     (user_id, timestamp_ms, query_text, result_uri, result_position, uri_count, action, time_to_action_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
 
   sqlight.query(
     sql,
@@ -1498,6 +1517,8 @@ pub fn log_search_conversion(
       sqlight.int(timestamp_ms),
       sqlight.nullable(sqlight.text, query_text),
       sqlight.nullable(sqlight.text, result_uri),
+      sqlight.nullable(sqlight.int, result_position),
+      sqlight.int(uri_count),
       sqlight.text(action),
       sqlight.nullable(sqlight.int, time_to_action_ms),
     ],

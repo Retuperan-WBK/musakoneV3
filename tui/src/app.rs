@@ -158,13 +158,15 @@ pub enum SeItem {
     Mode,
     Search,
     Reset,
-    Results(usize),
+    Results,
     Song(Track),
+    Artist(Ref),
+    Album(Ref),
 }
 
 impl SeItem {
     pub fn inactive(&self) -> bool {
-        matches!(self, SeItem::Sep | SeItem::Results(_))
+        matches!(self, SeItem::Sep | SeItem::Results)
     }
 }
 
@@ -219,7 +221,7 @@ pub enum Msg {
     Options(bool, bool, bool, bool),
     Browsed(String, Vec<Ref>),
     Tracks(Vec<Track>),
-    Searched(Vec<Track>),
+    Searched(Vec<Track>, Vec<Ref>, Vec<Ref>),
     Artists(Vec<Ref>),
     Albums(String, Vec<Ref>),
     AlbumTracks(String, Vec<String>),
@@ -256,6 +258,8 @@ pub enum PromptKind {
 pub struct Prompt {
     pub label: String,
     pub buf: String,
+    /// Byte offset of the edit cursor within `buf`
+    pub cursor: usize,
     pub masked: bool,
     pub kind: PromptKind,
 }
@@ -322,6 +326,11 @@ pub struct App {
     pub se_in_db: bool,
     pub se_mode: usize,
     pub se_searching: bool,
+    pub se_tracks: Vec<Track>,
+    pub se_artists: Vec<Ref>,
+    pub se_albums: Vec<Ref>,
+    /// Result tab like the web UI: 0 songs, 1 artists, 2 albums
+    pub se_tab: usize,
 
     pub lib_artists: Menu<Ref>,
     pub lib_albums: Menu<AlbumEntry>,
@@ -404,6 +413,10 @@ impl App {
             se_in_db: true,
             se_mode: 0,
             se_searching: false,
+            se_tracks: vec![],
+            se_artists: vec![],
+            se_albums: vec![],
+            se_tab: 0,
             lib_artists: Menu::default(),
             lib_albums: Menu::default(),
             lib_songs: Menu::default(),
@@ -527,6 +540,7 @@ impl App {
         self.prompt = Some(Prompt {
             label: "Username: ".into(),
             buf: String::new(),
+            cursor: 0,
             masked: false,
             kind: PromptKind::Username,
         });
@@ -762,7 +776,48 @@ impl App {
 
     fn se_reset(&mut self) {
         self.se_fields = Default::default();
+        self.se_tracks.clear();
+        self.se_artists.clear();
+        self.se_albums.clear();
         self.se.set(Self::se_static());
+    }
+
+    /// Static form + results block for the active tab.
+    fn se_rebuild(&mut self, keep_cursor: bool) {
+        let mut items = Self::se_static();
+        if self.se_has_results() {
+            items.push(SeItem::Sep);
+            items.push(SeItem::Results);
+            items.push(SeItem::Sep);
+            match self.se_tab {
+                0 => items.extend(self.se_tracks.iter().cloned().map(SeItem::Song)),
+                1 => items.extend(self.se_artists.iter().cloned().map(SeItem::Artist)),
+                _ => items.extend(self.se_albums.iter().cloned().map(SeItem::Album)),
+            }
+        }
+        let cursor = self.se.cursor;
+        self.se.set(items);
+        if self.se_has_results() {
+            self.se.cursor = if keep_cursor && cursor >= 20 {
+                cursor
+            } else {
+                20
+            };
+            self.se.clamp();
+            if self.se.cursor < 20 {
+                self.se.cursor = 20.min(self.se.len().saturating_sub(1));
+            }
+            self.se.fix_offset();
+        }
+    }
+
+    pub fn se_has_results(&self) -> bool {
+        !self.se_tracks.is_empty() || !self.se_artists.is_empty() || !self.se_albums.is_empty()
+    }
+
+    fn se_switch_tab(&mut self, d: isize) {
+        self.se_tab = (self.se_tab as isize + d).rem_euclid(3) as usize;
+        self.se_rebuild(false);
     }
 
     fn se_run(&mut self) {
@@ -789,7 +844,7 @@ impl App {
                 .map(|t| t.track.clone())
                 .filter(|t| se_matches(t, &fields, exact))
                 .collect();
-            self.on_msg(Msg::Searched(hits));
+            self.on_msg(Msg::Searched(hits, vec![], vec![]));
             return;
         }
         let rpc = self.rpc.clone();
@@ -802,6 +857,8 @@ impl App {
                 .await?;
             let mut seen = HashSet::new();
             let mut tracks = vec![];
+            let mut artists = vec![];
+            let mut albums = vec![];
             for res in v.as_array().into_iter().flatten() {
                 for t in res
                     .get("tracks")
@@ -815,8 +872,58 @@ impl App {
                         }
                     }
                 }
+                for a in res
+                    .get("artists")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let (Some(uri), Some(name)) = (
+                        a.get("uri").and_then(Value::as_str),
+                        a.get("name").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    if seen.insert(uri.to_string()) {
+                        artists.push(Ref {
+                            kind: "artist".into(),
+                            uri: uri.into(),
+                            name: name.into(),
+                        });
+                    }
+                }
+                for a in res
+                    .get("albums")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let (Some(uri), Some(name)) = (
+                        a.get("uri").and_then(Value::as_str),
+                        a.get("name").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    if !seen.insert(uri.to_string()) {
+                        continue;
+                    }
+                    let artist = a
+                        .pointer("/artists/0/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let label = if artist.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{artist} - {name}")
+                    };
+                    albums.push(Ref {
+                        kind: "album".into(),
+                        uri: uri.into(),
+                        name: label,
+                    });
+                }
             }
-            Ok(Msg::Searched(tracks))
+            Ok(Msg::Searched(tracks, artists, albums))
         });
     }
 
@@ -1254,25 +1361,26 @@ impl App {
                     self.lib_sync_songs();
                 }
             }
-            Msg::Searched(tracks) => {
+            Msg::Searched(tracks, artists, albums) => {
                 self.se_searching = false;
                 self.remember(tracks.iter().cloned());
-                let n = tracks.len();
-                let mut items = Self::se_static();
-                if n > 0 {
-                    items.push(SeItem::Sep);
-                    items.push(SeItem::Results(n));
-                    items.push(SeItem::Sep);
-                    items.extend(tracks.into_iter().map(SeItem::Song));
+                self.se_tracks = tracks;
+                self.se_artists = artists;
+                self.se_albums = albums;
+                // Songs first; fall back to whichever tab has something
+                self.se_tab = if !self.se_tracks.is_empty() {
+                    0
+                } else if !self.se_artists.is_empty() {
+                    1
+                } else {
+                    2
+                };
+                if self.se_has_results() {
                     self.say("Searching finished");
                 } else {
                     self.say("No results found");
                 }
-                self.se.set(items);
-                if n > 0 {
-                    self.se.cursor = 20;
-                    self.se.fix_offset();
-                }
+                self.se_rebuild(false);
             }
             Msg::Artists(a) => {
                 self.lib_loading = false;
@@ -1346,7 +1454,8 @@ impl App {
         if self.popup.is_some() {
             return self.popup_key(k);
         }
-        let columns = matches!(self.screen, Screen::Library | Screen::Editor);
+        let columns = matches!(self.screen, Screen::Library | Screen::Editor)
+            || (self.screen == Screen::Search && self.se_has_results());
         match k.code {
             K::Char('q') => self.quit = true,
             K::F(1) => self.goto(Screen::Help),
@@ -1485,6 +1594,7 @@ impl App {
                 self.prompt = Some(Prompt {
                     label: "Username: ".into(),
                     buf: String::new(),
+                    cursor: 0,
                     masked: false,
                     kind: PromptKind::Username,
                 });
@@ -1535,9 +1645,11 @@ impl App {
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        let cursor = buf.len();
         self.prompt = Some(Prompt {
             label: label.into(),
             buf,
+            cursor,
             masked,
             kind,
         });
@@ -1574,6 +1686,7 @@ impl App {
             Screen::Editor => {
                 self.ed_col = (self.ed_col as isize + d).clamp(0, 1) as usize;
             }
+            Screen::Search => self.se_switch_tab(d),
             _ => {}
         }
     }
@@ -1600,6 +1713,7 @@ impl App {
                 .into_iter()
                 .filter_map(|i| match i {
                     SeItem::Song(t) => Some(track_ref(t)),
+                    SeItem::Artist(r) | SeItem::Album(r) => Some(r.clone()),
                     _ => None,
                 })
                 .collect(),
@@ -1665,6 +1779,7 @@ impl App {
             }
             Screen::Search => match self.se.items.get(i)? {
                 SeItem::Song(t) => t.classic(),
+                SeItem::Artist(r) | SeItem::Album(r) => r.name.clone(),
                 _ => return None,
             },
             Screen::Library => match self.lib_col {
@@ -1976,7 +2091,9 @@ impl App {
                     self.rpc_fire("core.playback.play", json!({"tlid": tl.tlid}));
                 }
             }
-            (SeItem::Song(_), K::Char(' ')) => {
+            (SeItem::Song(_), K::Char(' '))
+            | (SeItem::Artist(_), K::Char(' '))
+            | (SeItem::Album(_), K::Char(' ')) => {
                 let refs = self.chosen_refs();
                 self.se.sel.iter_mut().for_each(|s| *s = false);
                 self.resolve(
@@ -1986,6 +2103,11 @@ impl App {
                         at: None,
                     },
                 );
+            }
+            (SeItem::Artist(r), K::Enter) | (SeItem::Album(r), K::Enter) => {
+                let r = r.clone();
+                self.goto(Screen::Browser);
+                self.browse_into(r.uri, r.name);
             }
             _ => {}
         }
@@ -2149,6 +2271,7 @@ impl App {
             }
             return;
         }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             K::Esc => {
                 self.prompt = None;
@@ -2158,10 +2281,38 @@ impl App {
                 self.submit(p.kind, p.buf);
             }
             K::Backspace => {
-                p.buf.pop();
+                if let Some(prev) = p.buf[..p.cursor].chars().next_back() {
+                    p.cursor -= prev.len_utf8();
+                    p.buf.remove(p.cursor);
+                }
             }
-            K::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => p.buf.clear(),
-            K::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => p.buf.push(c),
+            K::Delete => {
+                if p.cursor < p.buf.len() {
+                    p.buf.remove(p.cursor);
+                }
+            }
+            K::Left => {
+                if let Some(prev) = p.buf[..p.cursor].chars().next_back() {
+                    p.cursor -= prev.len_utf8();
+                }
+            }
+            K::Right => {
+                if let Some(next) = p.buf[p.cursor..].chars().next() {
+                    p.cursor += next.len_utf8();
+                }
+            }
+            K::Home => p.cursor = 0,
+            K::End => p.cursor = p.buf.len(),
+            K::Char('u') if ctrl => {
+                p.buf.clear();
+                p.cursor = 0;
+            }
+            K::Char('a') if ctrl => p.cursor = 0,
+            K::Char('e') if ctrl => p.cursor = p.buf.len(),
+            K::Char(c) if !ctrl => {
+                p.buf.insert(p.cursor, c);
+                p.cursor += c.len_utf8();
+            }
             _ => {}
         }
     }
