@@ -526,7 +526,7 @@ fn draw_menu<'a>(
             if s.style.add_modifier.contains(Modifier::BOLD) {
                 st = st.add_modifier(Modifier::BOLD);
             }
-            Span::styled(s.content, st)
+            Span::styled(plain(&s.content), st)
         };
         let right: Vec<Span> = r.right.into_iter().map(restyle).collect();
         let rw: usize = right.iter().map(|s| s.content.width()).sum();
@@ -684,11 +684,21 @@ fn column_widths(total: usize) -> Vec<usize> {
     out
 }
 
+/// Drop zero-width characters (combining marks, ZWJ, variation selectors). unicode-width
+/// counts them as 0 but the Linux console draws each codepoint in its own cell, so a
+/// title with them would run past its column and over the panel border.
+fn plain(s: &str) -> String {
+    s.chars().filter(|c| c.width().unwrap_or(0) > 0).collect()
+}
+
 fn pad(s: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for c in s.chars() {
         let cw = c.width().unwrap_or(0);
+        if cw == 0 {
+            continue; // console fonts give combining marks a cell of their own
+        }
         if used + cw > width {
             break;
         }
@@ -855,7 +865,6 @@ fn draw_browser(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
     let se = &app.se;
-    let cur_uri = app.current.as_ref().map(|c| c.track.uri.clone());
     // When the cursor is on a song and there's room, show a preview panel on the right
     // with that song's album art and full tags.
     let hovered = match se.cur() {
@@ -963,28 +972,10 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
                     bold: false,
                 }
             }
-            SeItem::Song(t) => {
-                // ncmpcpp-style emphasis: playing = bright accent, queued = bright/bold,
-                // not queued = dimmed, so what's already in the queue stands out.
-                let in_q = app.queue_uris.contains(&t.uri);
-                let playing = cur_uri.as_deref() == Some(t.uri.as_str());
-                let mut spans = song_columns(t, cw);
-                if playing {
-                    for sp in &mut spans {
-                        sp.style = sp.style.fg(NOW);
-                    }
-                } else if !in_q {
-                    for sp in &mut spans {
-                        sp.style = sp.style.fg(Color::DarkGray);
-                    }
-                }
-                Row {
-                    spans,
-                    right: vec![],
-                    sep: false,
-                    bold: in_q || playing,
-                }
-            }
+            // ncmpcpp (display.cpp setProperties): outside the playlist window a song
+            // that is already queued is drawn bold (= bright on the console); everything
+            // else keeps the plain column colours. Now-playing is not marked here.
+            SeItem::Song(t) => Row::song_cols(t, cw, app.queue_uris.contains(&t.uri)),
             SeItem::Artist(r) => Row::text(r.name.clone()),
             SeItem::Album(r) => Row::text(format!("[{}]", r.name)),
         },
@@ -1022,7 +1013,7 @@ fn draw_search_preview(f: &mut Frame, area: Rect, app: &App, t: &Track) {
         if !v.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled(format!("{k}: "), bold.fg(MAIN)),
-                Span::raw(v.to_string()),
+                Span::raw(plain(v)),
             ]));
         }
     };
