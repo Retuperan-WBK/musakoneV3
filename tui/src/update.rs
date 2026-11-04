@@ -45,22 +45,14 @@ pub async fn latest_sha() -> Result<String> {
         .ok_or_else(|| anyhow!("release notes carry no sha"))
 }
 
-/// Some(sha) when a newer build than this binary is published.
-pub async fn available() -> Option<String> {
-    let built = BUILT_SHA?;
-    let latest = latest_sha().await.ok()?;
-    (latest != built).then_some(latest)
-}
-
-pub async fn run() -> Result<()> {
+/// Replace the running binary with the published build. Ok(None) when already current.
+pub async fn apply() -> Result<Option<String>> {
     let latest = latest_sha().await?;
     if BUILT_SHA == Some(latest.as_str()) {
-        println!("musakone is up to date ({})", &latest[..7]);
-        return Ok(());
+        return Ok(None);
     }
     let asset = asset_name()?;
     let url = format!("https://github.com/{REPO}/releases/download/tui-latest/{asset}");
-    println!("downloading {url}");
     let bytes = client()
         .get(&url)
         .send()
@@ -77,6 +69,26 @@ pub async fn run() -> Result<()> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
     std::fs::rename(&tmp, &exe)?;
-    println!("updated {} to {}", exe.display(), &latest[..7]);
+    Ok(Some(latest))
+}
+
+/// Startup hook: CI builds pull the newest build in the background; dev builds do nothing.
+pub async fn auto() -> Option<String> {
+    BUILT_SHA?;
+    apply().await.ok().flatten()
+}
+
+pub async fn run() -> Result<()> {
+    match apply().await? {
+        None => println!(
+            "musakone is up to date ({})",
+            BUILT_SHA.map(|s| &s[..7]).unwrap_or("dev")
+        ),
+        Some(sha) => println!(
+            "updated {} to {}",
+            std::env::current_exe()?.display(),
+            &sha[..7]
+        ),
+    }
     Ok(())
 }

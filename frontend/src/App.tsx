@@ -5,7 +5,6 @@ import { Layout } from './components/Layout';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { LibraryView } from './routes/LibraryView';
 import { Login } from './routes/Login';
-import { MixView } from './routes/MixView';
 import { PlaylistDetailView } from './routes/PlaylistDetailView';
 import { PlaylistsView } from './routes/PlaylistsView';
 import { QueueView } from './routes/QueueView';
@@ -107,15 +106,11 @@ export const App = () => {
                 </Route>
 
                 <Route path="/mix">
-                    <ProtectedRoute>
-                        <Layout>
-                            <MixView />
-                        </Layout>
-                    </ProtectedRoute>
+                    <Redirect to="/" />
                 </Route>
 
                 <Route path="/analytics">
-                    <Redirect to="/mix" />
+                    <Redirect to="/" />
                 </Route>
             </Switch>
         </div>

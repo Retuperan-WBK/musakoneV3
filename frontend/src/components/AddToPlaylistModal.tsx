@@ -3,6 +3,7 @@ import { Check, ListMusic, Plus, X } from 'lucide-preact';
 import { useEffect, useState } from 'preact/hooks';
 import { useModalDismiss } from '../hooks/useModalDismiss';
 import * as playlistService from '../services/playlists';
+import { currentUser } from '../stores/auth';
 import {
     addToPlaylistModalOpen,
     addToPlaylistTrackUri,
@@ -28,7 +29,10 @@ export function AddToPlaylistModal() {
 }
 
 function AddToPlaylistModalInner({ trackUri }: { trackUri: string }) {
-    const items = useStore(playlists);
+    const all = useStore(playlists);
+    const user = useStore(currentUser);
+    // Only the caller's own playlists are editable
+    const items = all.filter((p) => user !== null && p.user_id === user.id);
     const [creating, setCreating] = useState(false);
     const [newName, setNewName] = useState('');
     const [loading, setLoading] = useState(false);

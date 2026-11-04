@@ -96,7 +96,9 @@ fn load_migrations(migrations_dir: String) -> Result(List(Migration), String) {
 }
 
 /// Parse migration filename in format V1__name.sql
-fn parse_migration_filename(filename: String) -> Result(#(Int, String), String) {
+fn parse_migration_filename(
+  filename: String,
+) -> Result(#(Int, String), String) {
   case string.split(filename, "__") {
     [version_part, name_part] -> {
       // Extract version number from V1 format

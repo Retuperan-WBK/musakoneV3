@@ -1,6 +1,5 @@
 import auth/jwt.{type Jwt, type Verified}
 import auth/service
-import autoplay.{type AutoplayMessage}
 import db/queries
 import event_bus.{type BusMessage}
 import gleam/bytes_tree
@@ -17,7 +16,6 @@ import gleam/string
 import gleam/time/timestamp
 import logging
 import mist.{type ResponseData}
-import mopidy_rpc.{type RpcMessage}
 import playback_state.{type PlaybackStateMessage, type PlaybackStateSnapshot}
 import sqlight
 
@@ -27,8 +25,6 @@ pub type AppState {
     jwt_secret: String,
     event_bus: Subject(BusMessage),
     playback_state: Subject(PlaybackStateMessage),
-    rpc: Subject(RpcMessage),
-    autoplay: Subject(AutoplayMessage),
   )
 }
 
@@ -219,7 +215,10 @@ pub fn get_events(
 }
 
 /// Get user statistics
-pub fn get_stats(state: AppState, auth_header: String) -> Response(ResponseData) {
+pub fn get_stats(
+  state: AppState,
+  auth_header: String,
+) -> Response(ResponseData) {
   case extract_token(auth_header) {
     Ok(token) -> {
       case verify_jwt_token(token, state.jwt_secret) {
@@ -392,13 +391,8 @@ pub fn get_admin_dashboard(
           let all_users = queries.get_all_users_with_activity(state.db)
           let total_counts = queries.get_event_counts(state.db)
           let now_playing =
-            process.call(
-              state.playback_state,
-              2000,
-              playback_state.GetState,
-            )
-          let state_timeline =
-            queries.get_playback_state_history(state.db, 20)
+            process.call(state.playback_state, 2000, playback_state.GetState)
+          let state_timeline = queries.get_playback_state_history(state.db, 20)
 
           json.object([
             #(
@@ -729,6 +723,7 @@ fn encode_playlist(p: queries.Playlist) -> json.Json {
     #("name", json.string(p.name)),
     #("description", json.nullable(p.description, json.string)),
     #("is_public", json.bool(p.is_public)),
+    #("username", json.string(p.username)),
     #("created_at", json.int(p.created_at)),
     #("updated_at", json.int(p.updated_at)),
   ])
@@ -740,6 +735,14 @@ fn encode_playlist_track(t: queries.PlaylistTrack) -> json.Json {
     #("track_uri", json.string(t.track_uri)),
     #("position", json.int(t.position)),
   ])
+}
+
+/// INSERT/UPDATE ... RETURNING cannot join users, so re-read the row for its owner name.
+fn with_owner(state: AppState, p: queries.Playlist) -> queries.Playlist {
+  case queries.get_playlist_by_id(state.db, p.id) {
+    Ok([full, ..]) -> full
+    _ -> p
+  }
 }
 
 /// Verify playlist ownership: returns Ok(playlist) if user_id matches
@@ -760,7 +763,7 @@ fn verify_ownership(
   }
 }
 
-/// List all playlists for the current user
+/// List every playlist with its owner; playlists are shared room-wide
 pub fn list_playlists(
   state: AppState,
   auth_header: String,
@@ -770,8 +773,8 @@ pub fn list_playlists(
       case verify_jwt_token(token, state.jwt_secret) {
         Ok(jwt_data) -> {
           case get_user_id_from_jwt(jwt_data) {
-            Ok(user_id) -> {
-              case queries.get_user_playlists(state.db, user_id) {
+            Ok(_user_id) -> {
+              case queries.get_all_playlists(state.db) {
                 Ok(playlists) -> {
                   json.array(playlists, encode_playlist)
                   |> json.to_string
@@ -784,39 +787,7 @@ pub fn list_playlists(
           }
         }
         Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
-      }
-    }
-    Error(e) -> error_response(e, 401)
-  }
-}
-
-/// List all public playlists from all users
-pub fn list_public_playlists(
-  state: AppState,
-  auth_header: String,
-) -> Response(ResponseData) {
-  case extract_token(auth_header) {
-    Ok(token) -> {
-      case verify_jwt_token(token, state.jwt_secret) {
-        Ok(_) -> {
-          case queries.get_public_playlists(state.db) {
-            Ok(playlists) -> {
-              json.array(playlists, encode_playlist)
-              |> json.to_string
-              |> respond_json(200)
-            }
-            Error(_) -> error_response("Database error", 500)
-          }
-        }
-        Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
+          error_response("Invalid or expired token: " <> string.inspect(e), 401)
       }
     }
     Error(e) -> error_response(e, 401)
@@ -854,10 +825,7 @@ pub fn get_playlists_containing_track(
           }
         }
         Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
+          error_response("Invalid or expired token: " <> string.inspect(e), 401)
       }
     }
     Error(e) -> error_response(e, 401)
@@ -889,7 +857,7 @@ pub fn create_playlist(
                     )
                   {
                     Ok([playlist, ..]) ->
-                      encode_playlist(playlist)
+                      encode_playlist(with_owner(state, playlist))
                       |> json.to_string
                       |> respond_json(201)
                     _ -> error_response("Failed to create playlist", 500)
@@ -902,17 +870,14 @@ pub fn create_playlist(
           }
         }
         Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
+          error_response("Invalid or expired token: " <> string.inspect(e), 401)
       }
     }
     Error(e) -> error_response(e, 401)
   }
 }
 
-/// Get a single playlist with its tracks (owner or public)
+/// Get a single playlist with its tracks (readable by every logged-in user)
 pub fn get_playlist(
   state: AppState,
   auth_header: String,
@@ -923,23 +888,18 @@ pub fn get_playlist(
       case verify_jwt_token(token, state.jwt_secret) {
         Ok(jwt_data) -> {
           case get_user_id_from_jwt(jwt_data) {
-            Ok(user_id) -> {
+            Ok(_user_id) -> {
               case queries.get_playlist_by_id(state.db, playlist_id) {
                 Ok([playlist, ..]) -> {
-                  case playlist.user_id == user_id || playlist.is_public {
-                    True -> {
-                      let tracks =
-                        queries.get_playlist_tracks(state.db, playlist_id)
-                        |> result.unwrap([])
-                      json.object([
-                        #("playlist", encode_playlist(playlist)),
-                        #("tracks", json.array(tracks, encode_playlist_track)),
-                      ])
-                      |> json.to_string
-                      |> respond_json(200)
-                    }
-                    False -> error_response("Forbidden", 403)
-                  }
+                  let tracks =
+                    queries.get_playlist_tracks(state.db, playlist_id)
+                    |> result.unwrap([])
+                  json.object([
+                    #("playlist", encode_playlist(playlist)),
+                    #("tracks", json.array(tracks, encode_playlist_track)),
+                  ])
+                  |> json.to_string
+                  |> respond_json(200)
                 }
                 Ok([]) -> error_response("Playlist not found", 404)
                 Error(_) -> error_response("Database error", 500)
@@ -949,10 +909,7 @@ pub fn get_playlist(
           }
         }
         Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
+          error_response("Invalid or expired token: " <> string.inspect(e), 401)
       }
     }
     Error(e) -> error_response(e, 401)
@@ -987,7 +944,7 @@ pub fn update_playlist(
                         )
                       {
                         Ok([playlist, ..]) ->
-                          encode_playlist(playlist)
+                          encode_playlist(with_owner(state, playlist))
                           |> json.to_string
                           |> respond_json(200)
                         _ -> error_response("Failed to update playlist", 500)
@@ -1003,10 +960,7 @@ pub fn update_playlist(
           }
         }
         Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
+          error_response("Invalid or expired token: " <> string.inspect(e), 401)
       }
     }
     Error(e) -> error_response(e, 401)
@@ -1032,8 +986,7 @@ pub fn delete_playlist(
                       json.object([#("ok", json.bool(True))])
                       |> json.to_string
                       |> respond_json(200)
-                    Error(_) ->
-                      error_response("Failed to delete playlist", 500)
+                    Error(_) -> error_response("Failed to delete playlist", 500)
                   }
                 }
                 Error(resp) -> resp
@@ -1043,10 +996,7 @@ pub fn delete_playlist(
           }
         }
         Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
+          error_response("Invalid or expired token: " <> string.inspect(e), 401)
       }
     }
     Error(e) -> error_response(e, 401)
@@ -1089,10 +1039,7 @@ pub fn add_playlist_track(
                             )
                           // Touch updated_at on the playlist
                           let _ = case
-                            queries.get_playlist_by_id(
-                              state.db,
-                              playlist_id,
-                            )
+                            queries.get_playlist_by_id(state.db, playlist_id)
                           {
                             Ok([p, ..]) ->
                               queries.update_playlist(
@@ -1126,10 +1073,7 @@ pub fn add_playlist_track(
           }
         }
         Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
+          error_response("Invalid or expired token: " <> string.inspect(e), 401)
       }
     }
     Error(e) -> error_response(e, 401)
@@ -1179,10 +1123,7 @@ pub fn remove_playlist_track(
           }
         }
         Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
+          error_response("Invalid or expired token: " <> string.inspect(e), 401)
       }
     }
     Error(e) -> error_response(e, 401)
@@ -1232,10 +1173,7 @@ pub fn reorder_playlist_track(
           }
         }
         Error(e) ->
-          error_response(
-            "Invalid or expired token: " <> string.inspect(e),
-            401,
-          )
+          error_response("Invalid or expired token: " <> string.inspect(e), 401)
       }
     }
     Error(e) -> error_response(e, 401)

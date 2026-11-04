@@ -8,6 +8,8 @@ pub struct Track {
     pub name: String,
     pub artists: String,
     pub album: String,
+    pub date: String,
+    pub track_no: Option<u64>,
     pub length: Option<u64>,
 }
 
@@ -36,22 +38,71 @@ impl Track {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let length = v.get("length").and_then(Value::as_u64);
+        let date = v
+            .get("date")
+            .and_then(Value::as_str)
+            .or_else(|| v.pointer("/album/date").and_then(Value::as_str))
+            .unwrap_or("")
+            .chars()
+            .take(4)
+            .collect();
         Some(Track {
             uri,
             name,
             artists,
             album,
-            length,
+            date,
+            track_no: v.get("track_no").and_then(Value::as_u64),
+            length: v.get("length").and_then(Value::as_u64),
         })
     }
 
-    /// "Artist - Title" like ncmpcpp's default song format.
-    pub fn title(&self) -> String {
+    /// `%f`: the last path segment of the uri, what ncmpcpp shows when tags are missing.
+    pub fn filename(&self) -> String {
+        let tail = self.uri.rsplit(['/', ':']).next().unwrap_or(&self.uri);
+        urldecode(tail)
+    }
+
+    /// `{%a - }{%t}|{%f}` (song_list_format without colours).
+    pub fn classic(&self) -> String {
+        if self.name.is_empty() {
+            return self.filename();
+        }
         if self.artists.is_empty() {
             self.name.clone()
         } else {
             format!("{} - {}", self.artists, self.name)
+        }
+    }
+
+    /// `{{%a{ "%b"{ (%y)}} - }{%t}}|{%f}` (song_status_format).
+    pub fn status(&self) -> String {
+        if self.name.is_empty() {
+            return self.filename();
+        }
+        let mut s = String::new();
+        if !self.artists.is_empty() {
+            s.push_str(&self.artists);
+            if !self.album.is_empty() {
+                s.push_str(&format!(" \"{}\"", self.album));
+                if !self.date.is_empty() {
+                    s.push_str(&format!(" ({})", self.date));
+                }
+            }
+            s.push_str(" - ");
+        }
+        s.push_str(&self.name);
+        s
+    }
+
+    /// `{%n - }{%t}|{%f}` (song_library_format).
+    pub fn library(&self) -> String {
+        if self.name.is_empty() {
+            return self.filename();
+        }
+        match self.track_no {
+            Some(n) => format!("{n} - {}", self.name),
+            None => self.name.clone(),
         }
     }
 
@@ -60,6 +111,25 @@ impl Track {
     }
 }
 
+pub fn urldecode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// MPD::Song::ShowTime: m:ss or h:mm:ss.
 pub fn fmt_ms(ms: u64) -> String {
     let s = ms / 1000;
     if s >= 3600 {
@@ -67,6 +137,25 @@ pub fn fmt_ms(ms: u64) -> String {
     } else {
         format!("{}:{:02}", s / 60, s % 60)
     }
+}
+
+/// helpers.h ShowTime(long names): "1 day, 2 hours, 3 minutes, 4 seconds".
+pub fn fmt_long(ms: u64) -> String {
+    let mut s = ms / 1000;
+    let mut parts = vec![];
+    for (unit, one, many) in [
+        (86400, "day", "days"),
+        (3600, "hour", "hours"),
+        (60, "minute", "minutes"),
+        (1, "second", "seconds"),
+    ] {
+        let n = s / unit;
+        if n > 0 {
+            parts.push(format!("{n} {}", if n == 1 { one } else { many }));
+            s -= n * unit;
+        }
+    }
+    parts.join(", ")
 }
 
 #[derive(Clone, Debug)]
@@ -89,7 +178,7 @@ impl TlTrack {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Ref {
     #[serde(rename = "type")]
     pub kind: String,
@@ -101,6 +190,9 @@ impl Ref {
     pub fn is_track(&self) -> bool {
         self.kind == "track"
     }
+    pub fn is_playlist(&self) -> bool {
+        self.kind == "playlist"
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -109,7 +201,7 @@ pub struct Playlist {
     pub user_id: i64,
     pub name: String,
     #[serde(default)]
-    pub is_public: bool,
+    pub username: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -122,56 +214,30 @@ pub struct PlaylistWithTracks {
     pub tracks: Vec<PlaylistTrack>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct Recommendation {
-    pub uri: String,
-    pub name: String,
-    #[serde(default)]
-    pub artist: String,
-    #[serde(default)]
-    pub duration_ms: Option<u64>,
-    #[serde(default)]
-    pub reasons: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Recommendations {
-    pub items: Vec<Recommendation>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct AutoplaySettings {
-    pub enabled: bool,
-    pub min_ahead: i64,
-    pub batch_size: i64,
-    pub discovery: f64,
-    pub mode: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct AutoplayStatus {
-    pub settings: AutoplaySettings,
-    #[serde(default)]
-    pub added_24h: i64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn decodes_mopidy_track_and_formats_time() {
+    fn decodes_mopidy_track_and_formats() {
         let v: Value = serde_json::from_str(
-            &r#"{"__model__":"TlTrack","tlid":7,"track":{"uri":"tidal:track:1","name":"Kaipaus",
-                "artists":[{"name":"Retuperän WBK"}],"album":{"name":"Valioita"},"length":156000}}"#
-                .replace("Kaipaus", "Kaipaus ()"),
+            r#"{"__model__":"TlTrack","tlid":7,"track":{"uri":"tidal:track:1","name":"Kaipaus ()",
+                "artists":[{"name":"Retuperän WBK"}],"album":{"name":"Valioita","date":"1999-01-01"},"track_no":3,"length":156000}}"#,
         )
         .unwrap();
         let t = TlTrack::from_value(&v).unwrap();
         assert_eq!(t.tlid, 7);
-        assert_eq!(t.track.title(), "Retuperän WBK - Kaipaus");
+        assert_eq!(t.track.classic(), "Retuperän WBK - Kaipaus");
+        assert_eq!(
+            t.track.status(),
+            "Retuperän WBK \"Valioita\" (1999) - Kaipaus"
+        );
+        assert_eq!(t.track.library(), "3 - Kaipaus");
         assert_eq!(t.track.duration(), "2:36");
         assert_eq!(fmt_ms(3_723_000), "1:02:03");
+        assert_eq!(fmt_long(90_061_000), "1 day, 1 hour, 1 minute, 1 second");
+        assert_eq!(fmt_long(120_000), "2 minutes");
         assert_eq!(Track::from_value(&Value::Null), None);
+        assert_eq!(urldecode("Royal%20Chill.m3u8"), "Royal Chill.m3u8");
     }
 }

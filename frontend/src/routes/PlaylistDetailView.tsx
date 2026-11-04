@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/preact';
-import { ChevronLeft, Edit3, Globe, Music, Play, Trash2, X } from 'lucide-preact';
+import { ChevronLeft, Edit3, Music, Play, Trash2, X } from 'lucide-preact';
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useLocation, useRoute } from 'wouter';
 import { TrackItem } from '../components/TrackItem';
@@ -115,30 +115,13 @@ export function PlaylistDetailView() {
             await playlistService.updatePlaylist(
                 playlistId,
                 editName.trim(),
-                editDesc.trim() || undefined,
-                playlist?.is_public
+                editDesc.trim() || undefined
             );
             setEditing(false);
             await loadPlaylist();
         } catch (err) {
             console.error('Failed to update playlist:', err);
             toastError('Could not save playlist');
-        }
-    };
-
-    const handleTogglePublic = async () => {
-        if (!playlistId || !playlist) return;
-        try {
-            await playlistService.updatePlaylist(
-                playlistId,
-                playlist.name,
-                playlist.description || undefined,
-                !playlist.is_public
-            );
-            await loadPlaylist();
-        } catch (err) {
-            console.error('Failed to toggle public:', err);
-            toastError('Could not change playlist visibility');
         }
     };
 
@@ -235,34 +218,12 @@ export function PlaylistDetailView() {
                         <div className="flex-1 min-w-0">
                             <div className="text-fg-primary truncate text-sm font-medium">
                                 {playlist.name}
-                                {playlist.is_public && (
-                                    <Globe
-                                        size={12}
-                                        className="inline-block ml-1 text-fg-tertiary"
-                                    />
-                                )}
                             </div>
-                            {playlist.description && (
-                                <div className="text-xs text-fg-tertiary truncate">
-                                    {playlist.description}
-                                </div>
-                            )}
+                            <div className="text-xs text-fg-tertiary truncate">
+                                {isOwner ? 'by you' : `by ${playlist.username}`}
+                                {playlist.description ? ` · ${playlist.description}` : ''}
+                            </div>
                         </div>
-                        {isOwner && (
-                            <button
-                                type="button"
-                                className={`flex items-center justify-center w-8 h-8 bg-transparent border cursor-pointer shrink-0 transition-all duration-150 ${playlist.is_public ? 'border-accent-primary text-accent-primary' : 'border-border-primary text-fg-tertiary hover:text-accent-primary hover:border-accent-primary'}`}
-                                onClick={handleTogglePublic}
-                                aria-label={playlist.is_public ? 'Make private' : 'Make public'}
-                                title={
-                                    playlist.is_public
-                                        ? 'Public — tap to make private'
-                                        : 'Private — tap to make public'
-                                }
-                            >
-                                <Globe size={14} />
-                            </button>
-                        )}
                         {isOwner && (
                             <button
                                 type="button"

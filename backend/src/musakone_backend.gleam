@@ -13,10 +13,7 @@ import gleam/option
 import gleam/result
 import gleam/string
 import gleam/uri
-import autoplay
 import handlers/http as http_handlers
-import handlers/mix as mix_handlers
-import mopidy_rpc
 import logging
 import mist
 import playback_state
@@ -75,18 +72,6 @@ pub fn main() {
     |> result.map_error(string.inspect),
   )
 
-  // Request/response RPC layer for backend code (recommender, autoplay, handlers)
-  use rpc <- result.try(
-    mopidy_rpc.start(bus)
-    |> result.map_error(string.inspect),
-  )
-
-  // Autoplay: keeps the queue topped up from recommendations when enabled
-  use autoplay_actor <- result.try(
-    autoplay.start(db, rpc, bus)
-    |> result.map_error(string.inspect),
-  )
-
   logging.log(logging.Info, "")
 
   // Create app state
@@ -96,8 +81,6 @@ pub fn main() {
       jwt_secret: jwt_secret,
       event_bus: bus,
       playback_state: ps_actor,
-      rpc: rpc,
-      autoplay: autoplay_actor,
     )
 
   // Start Mist server
@@ -238,74 +221,6 @@ fn handle_request(
       }
     }
 
-    // Mix: recommendations, autoplay, insights
-    http.Get, ["api", "recommendations"] -> {
-      case get_auth_header(req) {
-        Ok(auth_header) -> {
-          let query_params =
-            req.query
-            |> option.unwrap("")
-            |> uri.parse_query
-            |> result.unwrap([])
-          let scope =
-            list.key_find(query_params, "scope") |> result.unwrap("me")
-          let limit =
-            list.key_find(query_params, "limit")
-            |> result.try(int.parse)
-            |> result.unwrap(20)
-          mix_handlers.get_recommendations(state, auth_header, scope, limit)
-          |> with_cors
-        }
-        Error(e) -> error_response(e, 401) |> with_cors
-      }
-    }
-
-    http.Get, ["api", "insights"] -> {
-      case get_auth_header(req) {
-        Ok(auth_header) ->
-          mix_handlers.get_insights(state, auth_header) |> with_cors
-        Error(e) -> error_response(e, 401) |> with_cors
-      }
-    }
-
-    http.Get, ["api", "autoplay"] -> {
-      case get_auth_header(req) {
-        Ok(auth_header) ->
-          mix_handlers.get_autoplay(state, auth_header) |> with_cors
-        Error(e) -> error_response(e, 401) |> with_cors
-      }
-    }
-
-    http.Put, ["api", "autoplay"] -> {
-      case get_auth_header(req) {
-        Ok(auth_header) -> {
-          case mist.read_body(req, max_body_limit: 1024 * 1024) {
-            Ok(body_req) -> {
-              case bit_array.to_string(body_req.body) {
-                Ok(body) ->
-                  mix_handlers.put_autoplay(state, auth_header, body)
-                  |> with_cors
-                Error(_) ->
-                  error_response("Invalid UTF-8 in request body", 400)
-                  |> with_cors
-              }
-            }
-            Error(_) ->
-              error_response("Failed to read request body", 400) |> with_cors
-          }
-        }
-        Error(e) -> error_response(e, 401) |> with_cors
-      }
-    }
-
-    http.Post, ["api", "autoplay", "fill"] -> {
-      case get_auth_header(req) {
-        Ok(auth_header) ->
-          mix_handlers.post_autoplay_fill(state, auth_header) |> with_cors
-        Error(e) -> error_response(e, 401) |> with_cors
-      }
-    }
-
     // Playback state: current state (no auth — public "now playing")
     http.Get, ["api", "playback", "state"] -> {
       http_handlers.get_playback_state(state)
@@ -414,14 +329,6 @@ fn handle_request(
               |> with_cors
           }
         }
-        Error(e) -> error_response(e, 401) |> with_cors
-      }
-    }
-
-    http.Get, ["api", "playlists", "public"] -> {
-      case get_auth_header(req) {
-        Ok(auth_header) ->
-          http_handlers.list_public_playlists(state, auth_header) |> with_cors
         Error(e) -> error_response(e, 401) |> with_cors
       }
     }

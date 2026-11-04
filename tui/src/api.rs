@@ -1,4 +1,4 @@
-//! Gleam backend REST: auth, playlists, mix/autoplay. Plus LRCLIB for lyrics.
+//! Gleam backend REST: auth and the shared playlists. Plus LRCLIB for lyrics.
 use crate::model::*;
 use anyhow::{anyhow, bail, Result};
 use serde::de::DeserializeOwned;
@@ -18,6 +18,7 @@ impl Api {
             token: Mutex::new(token),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .user_agent("musakone-tui/0.1 (https://github.com/Retuperan-WBK/musakoneV3)")
                 .build()
                 .expect("http client"),
         }
@@ -53,10 +54,11 @@ impl Api {
             }
             bail!("{msg}");
         }
-        if text.is_empty() {
-            // DELETE and friends: synthesize null for `()`-like targets.
-            return serde_json::from_str("null").map_err(|e| anyhow!(e));
-        }
+        let text = if text.is_empty() {
+            "null".to_string()
+        } else {
+            text
+        };
         serde_json::from_str(&text).map_err(|e| anyhow!("bad response for {path}: {e}"))
     }
 
@@ -83,19 +85,26 @@ impl Api {
             .ok_or_else(|| anyhow!("no token in login response"))
     }
 
-    pub async fn me(&self) -> Result<Value> {
-        self.get("/api/auth/me").await
+    /// Current user id, or Err("unauthorized…") when the token is dead.
+    pub async fn me(&self) -> Result<i64> {
+        let v: Value = self.get("/api/auth/me").await?;
+        v.get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("no id in /me"))
     }
 
+    /// Every playlist. The current backend returns them all from /api/playlists; the
+    /// previous release returned only the caller's and had the rest under /public.
     pub async fn playlists(&self) -> Result<Vec<Playlist>> {
-        let mut mine: Vec<Playlist> = self.get("/api/playlists").await?;
-        let public: Vec<Playlist> = self.get("/api/playlists/public").await.unwrap_or_default();
-        for p in public {
-            if !mine.iter().any(|m| m.id == p.id) {
-                mine.push(p);
+        let mut all: Vec<Playlist> = self.get("/api/playlists").await?;
+        if let Ok(public) = self.get::<Vec<Playlist>>("/api/playlists/public").await {
+            for p in public {
+                if !all.iter().any(|a| a.id == p.id) {
+                    all.push(p);
+                }
             }
         }
-        Ok(mine)
+        Ok(all)
     }
     pub async fn playlist_tracks(&self, id: i64) -> Result<Vec<String>> {
         let p: PlaylistWithTracks = self.get(&format!("/api/playlists/{id}")).await?;
@@ -104,14 +113,14 @@ impl Api {
     pub async fn create_playlist(&self, name: &str) -> Result<Playlist> {
         self.post(
             "/api/playlists",
-            json!({"name": name, "description": null, "is_public": false}),
+            json!({"name": name, "description": null, "is_public": true}),
         )
         .await
     }
-    pub async fn rename_playlist(&self, p: &Playlist, name: &str) -> Result<Playlist> {
+    pub async fn rename_playlist(&self, id: i64, name: &str) -> Result<Playlist> {
         self.put(
-            &format!("/api/playlists/{}", p.id),
-            json!({"name": name, "description": null, "is_public": p.is_public}),
+            &format!("/api/playlists/{id}"),
+            json!({"name": name, "description": null, "is_public": true}),
         )
         .await
     }
@@ -153,27 +162,9 @@ impl Api {
         Ok(())
     }
 
-    pub async fn autoplay(&self) -> Result<AutoplayStatus> {
-        self.get("/api/autoplay").await
-    }
-    pub async fn set_autoplay(&self, patch: Value) -> Result<AutoplayStatus> {
-        self.put("/api/autoplay", patch).await
-    }
-    pub async fn autoplay_fill(&self) -> Result<i64> {
-        let v: Value = self.post("/api/autoplay/fill", json!({})).await?;
-        Ok(v.get("added").and_then(Value::as_i64).unwrap_or(0))
-    }
-    pub async fn recommendations(&self, scope: &str) -> Result<Vec<Recommendation>> {
-        let r: Recommendations = self
-            .get(&format!("/api/recommendations?scope={scope}&limit=30"))
-            .await?;
-        Ok(r.items)
-    }
-
-    /// Lyrics from LRCLIB. Returns (synced lrc, plain). Disk-cached per track uri.
+    /// Lyrics from LRCLIB. Disk-cached per track uri.
     pub async fn lyrics(&self, track: &Track, cache_dir: &std::path::Path) -> Result<Lyrics> {
-        let key = track.uri.replace(['/', ':'], "_");
-        let path = cache_dir.join(format!("{key}.json"));
+        let path = cache_dir.join(format!("{}.json", lyrics_key(&track.uri)));
         if let Ok(s) = std::fs::read_to_string(&path) {
             if let Ok(l) = serde_json::from_str::<Lyrics>(&s) {
                 return Ok(l);
@@ -191,17 +182,9 @@ impl Api {
         if let Some(ms) = track.length {
             url += &format!("&duration={}", ms / 1000);
         }
-        let resp = self
-            .http
-            .get(&url)
-            .header(
-                "User-Agent",
-                "musakone-tui/0.1 (https://github.com/retuperan-wbk/musakoneV3)",
-            )
-            .send()
-            .await?;
+        let resp = self.http.get(&url).send().await?;
         let v: Value = if resp.status().as_u16() == 404 {
-            // Exact match failed: fall back to search by artist + title, take first hit.
+            // Exact match failed: fall back to search by artist + title, take the first hit.
             let s = self
                 .http
                 .get(format!(
@@ -209,7 +192,6 @@ impl Api {
                     urlenc(artist),
                     urlenc(&track.name)
                 ))
-                .header("User-Agent", "musakone-tui/0.1")
                 .send()
                 .await?
                 .json::<Value>()
@@ -236,6 +218,10 @@ impl Api {
     }
 }
 
+pub fn lyrics_key(uri: &str) -> String {
+    uri.replace(['/', ':'], "_")
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Lyrics {
     pub synced: Option<String>,
@@ -246,7 +232,10 @@ impl Lyrics {
     /// Lines as (timestamp ms or None, text). Synced preferred.
     pub fn lines(&self) -> Vec<(Option<u64>, String)> {
         if let Some(s) = &self.synced {
-            return s.lines().filter_map(parse_lrc_line).collect();
+            let v: Vec<_> = s.lines().filter_map(parse_lrc_line).collect();
+            if !v.is_empty() {
+                return v;
+            }
         }
         self.plain
             .as_deref()
@@ -264,8 +253,7 @@ pub fn parse_lrc_line(line: &str) -> Option<(Option<u64>, String)> {
         return None;
     }
     let end = line.find(']')?;
-    let stamp = &line[1..end];
-    let (m, rest) = stamp.split_once(':')?;
+    let (m, rest) = line[1..end].split_once(':')?;
     let m: u64 = m.parse().ok()?;
     let secs: f64 = rest.parse().ok()?;
     Some((

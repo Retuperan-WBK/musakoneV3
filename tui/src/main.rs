@@ -8,32 +8,42 @@ mod update;
 use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
+fn xdg(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(fallback)
         })
         .join("musakone")
 }
 
-fn cache_dir() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache")
-        })
-        .join("musakone")
+/// KEY=VALUE lines from ~/.config/musakone/env; real environment variables win.
+fn load_env_file(path: &Path) {
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let (k, v) = (k.trim(), v.trim().trim_matches('"'));
+            if std::env::var_os(k).is_none() {
+                std::env::set_var(k, v);
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg = config_dir();
+    let cfg = xdg("XDG_CONFIG_HOME", ".config");
     let url_file = cfg.join("url");
     let arg = std::env::args().nth(1);
     match arg.as_deref() {
@@ -44,6 +54,11 @@ async fn main() -> Result<()> {
             );
             println!("       musakone update        download the latest CI build over this binary");
             println!("       musakone --version");
+            println!();
+            println!(
+                "Credentials: MUSAKONE_USER / MUSAKONE_PASSWORD in the environment or in {}",
+                cfg.join("env").display()
+            );
             return Ok(());
         }
         Some("update") => return update::run().await,
@@ -57,6 +72,7 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
+    load_env_file(&cfg.join("env"));
     let base = arg
         .or_else(|| std::env::var("MUSAKONE_URL").ok())
         .or_else(|| {
@@ -80,6 +96,13 @@ async fn main() -> Result<()> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let creds = match (
+        std::env::var("MUSAKONE_USER"),
+        std::env::var("MUSAKONE_PASSWORD"),
+    ) {
+        (Ok(u), Ok(p)) if !u.is_empty() => Some((u, p)),
+        _ => None,
+    };
 
     let (msg_tx, mut msg_rx) = mpsc::unbounded_channel();
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
@@ -90,21 +113,22 @@ async fn main() -> Result<()> {
         api,
         msg_tx.clone(),
         token_path,
-        cache_dir().join("lyrics"),
+        xdg("XDG_CACHE_HOME", ".cache").join("lyrics"),
         token.is_some(),
+        creds,
     );
-
     {
         let tx = msg_tx.clone();
         tokio::spawn(async move {
-            if let Some(sha) = update::available().await {
+            if let Some(sha) = update::auto().await {
                 let _ = tx.send(app::Msg::Info(format!(
-                    "New build {} available: run `musakone update`",
+                    "Updated to build {}: restart musakone to use it",
                     &sha[..7]
                 )));
             }
         });
     }
+
     let mut terminal = ratatui::init();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(1000));

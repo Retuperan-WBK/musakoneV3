@@ -1,26 +1,29 @@
 import { useStore } from '@nanostores/preact';
-import { Globe, ListMusic, Plus, Trash2 } from 'lucide-preact';
+import { ListMusic, Plus, Trash2, User, Users } from 'lucide-preact';
 import { useEffect, useState } from 'preact/hooks';
 import { useLocation } from 'wouter';
 import { confirm } from '../components/ConfirmModal';
 import * as playlistService from '../services/playlists';
+import { currentUser } from '../stores/auth';
 import {
     playlists,
     playlistsError,
     playlistsLoading,
-    publicPlaylists,
     setPlaylists,
     setPlaylistsError,
     setPlaylistsLoading,
-    setPublicPlaylists,
 } from '../stores/playlists';
 import { toastError } from '../stores/toast';
 
-type Tab = 'mine' | 'public';
+type Tab = 'mine' | 'all';
 
+/**
+ * Every playlist is shared with the whole room. "Mine" lists the ones you own and
+ * can edit; "All" lists everyone's with the creator's name.
+ */
 export function PlaylistsView() {
     const items = useStore(playlists);
-    const pubItems = useStore(publicPlaylists);
+    const user = useStore(currentUser);
     const loading = useStore(playlistsLoading);
     const error = useStore(playlistsError);
     const [, setLocation] = useLocation();
@@ -32,8 +35,7 @@ export function PlaylistsView() {
         setPlaylistsLoading(true);
         setPlaylistsError(null);
         try {
-            const data = await playlistService.listPlaylists();
-            setPlaylists(data);
+            setPlaylists(await playlistService.listPlaylists());
         } catch (err) {
             setPlaylistsError(err instanceof Error ? err.message : 'Failed to load playlists');
         } finally {
@@ -41,18 +43,8 @@ export function PlaylistsView() {
         }
     };
 
-    const loadPublicPlaylists = async () => {
-        try {
-            const data = await playlistService.listPublicPlaylists();
-            setPublicPlaylists(data);
-        } catch (err) {
-            console.error('Failed to load public playlists:', err);
-        }
-    };
-
     useEffect(() => {
         loadPlaylists();
-        loadPublicPlaylists();
     }, []);
 
     const handleCreate = async () => {
@@ -62,6 +54,7 @@ export function PlaylistsView() {
             await playlistService.createPlaylist(name);
             setNewName('');
             setCreating(false);
+            setActiveTab('mine');
             await loadPlaylists();
         } catch (err) {
             console.error('Failed to create playlist:', err);
@@ -80,7 +73,6 @@ export function PlaylistsView() {
                 try {
                     await playlistService.deletePlaylist(id);
                     await loadPlaylists();
-                    await loadPublicPlaylists();
                 } catch (err) {
                     console.error('Failed to delete playlist:', err);
                     toastError('Could not delete playlist');
@@ -89,47 +81,49 @@ export function PlaylistsView() {
         });
     };
 
-    const displayItems = activeTab === 'mine' ? items : pubItems;
+    const isMine = (p: { user_id: number }) => user !== null && p.user_id === user.id;
+    const displayItems = activeTab === 'mine' ? items.filter(isMine) : items;
+
+    const tabClass = (tab: Tab) =>
+        `flex-1 flex items-center justify-center gap-1 px-3 py-2 text-sm font-mono cursor-pointer bg-transparent border-none border-b-2 transition-colors duration-150 ${activeTab === tab ? 'text-accent-primary border-b-accent-primary' : 'text-fg-tertiary border-b-transparent hover:text-fg-secondary'}`;
 
     return (
         <div className="flex flex-col h-full overflow-hidden">
             {/* Header bar */}
             <div className="flex items-center justify-between px-4 py-2 border-b border-border-primary shrink-0 bg-bg-secondary">
                 <span className="text-fg-secondary text-sm">Playlists</span>
-                {activeTab === 'mine' && (
-                    <button
-                        type="button"
-                        className="flex items-center gap-1 px-2 py-1 bg-transparent border border-border-primary text-fg-secondary text-sm font-mono cursor-pointer transition-all duration-150 hover:text-accent-primary hover:border-accent-primary"
-                        onClick={() => setCreating(!creating)}
-                    >
-                        <Plus size={14} />
-                        New
-                    </button>
-                )}
+                <button
+                    type="button"
+                    className="flex items-center gap-1 px-2 py-1 bg-transparent border border-border-primary text-fg-secondary text-sm font-mono cursor-pointer transition-all duration-150 hover:text-accent-primary hover:border-accent-primary"
+                    onClick={() => setCreating(!creating)}
+                >
+                    <Plus size={14} />
+                    New
+                </button>
             </div>
 
             {/* Tab bar */}
             <div className="flex border-b border-border-primary shrink-0 bg-bg-secondary">
                 <button
                     type="button"
-                    className={`flex-1 flex items-center justify-center gap-1 px-3 py-2 text-sm font-mono cursor-pointer bg-transparent border-none border-b-2 transition-colors duration-150 ${activeTab === 'mine' ? 'text-accent-primary border-b-accent-primary' : 'text-fg-tertiary border-b-transparent hover:text-fg-secondary'}`}
+                    className={tabClass('mine')}
                     onClick={() => setActiveTab('mine')}
                 >
-                    <ListMusic size={14} />
+                    <User size={14} />
                     My Playlists
                 </button>
                 <button
                     type="button"
-                    className={`flex-1 flex items-center justify-center gap-1 px-3 py-2 text-sm font-mono cursor-pointer bg-transparent border-none border-b-2 transition-colors duration-150 ${activeTab === 'public' ? 'text-accent-primary border-b-accent-primary' : 'text-fg-tertiary border-b-transparent hover:text-fg-secondary'}`}
-                    onClick={() => setActiveTab('public')}
+                    className={tabClass('all')}
+                    onClick={() => setActiveTab('all')}
                 >
-                    <Globe size={14} />
-                    Public
+                    <Users size={14} />
+                    All
                 </button>
             </div>
 
             {/* Inline create form */}
-            {creating && activeTab === 'mine' && (
+            {creating && (
                 <div className="flex items-center gap-2 px-4 py-2 border-b border-border-primary bg-bg-tertiary">
                     <input
                         type="text"
@@ -155,11 +149,11 @@ export function PlaylistsView() {
             )}
 
             {/* Content */}
-            {loading && displayItems.length === 0 ? (
+            {loading && items.length === 0 ? (
                 <div className="flex items-center justify-center min-h-[50vh] text-fg-secondary">
                     Loading...
                 </div>
-            ) : error && activeTab === 'mine' ? (
+            ) : error ? (
                 <div className="flex flex-col items-center justify-center min-h-[50vh] gap-4 text-error text-center px-8">
                     <p>{error}</p>
                     <button
@@ -173,14 +167,10 @@ export function PlaylistsView() {
             ) : displayItems.length === 0 ? (
                 <div className="flex flex-col items-center justify-center min-h-[50vh] gap-2 text-fg-secondary text-center px-8">
                     <ListMusic size={32} className="text-fg-tertiary" />
-                    {activeTab === 'mine' ? (
-                        <>
-                            <p>No playlists yet</p>
-                            <p className="text-sm text-fg-tertiary">Tap "New" to create one</p>
-                        </>
-                    ) : (
-                        <p>No public playlists yet</p>
-                    )}
+                    <p>
+                        {activeTab === 'mine' ? 'No playlists of your own yet' : 'No playlists yet'}
+                    </p>
+                    <p className="text-sm text-fg-tertiary">Tap "New" to create one</p>
                 </div>
             ) : (
                 <div className="flex-1 overflow-y-auto overscroll-y-contain pb-2">
@@ -201,22 +191,13 @@ export function PlaylistsView() {
                         >
                             <ListMusic size={20} className="text-fg-tertiary shrink-0" />
                             <div className="flex-1 min-w-0">
-                                <div className="text-fg-primary truncate">
-                                    {playlist.name}
-                                    {playlist.is_public && activeTab === 'mine' && (
-                                        <Globe
-                                            size={12}
-                                            className="inline-block ml-1 text-fg-tertiary"
-                                        />
-                                    )}
+                                <div className="text-fg-primary truncate">{playlist.name}</div>
+                                <div className="text-sm text-fg-tertiary truncate">
+                                    {isMine(playlist) ? 'by you' : `by ${playlist.username}`}
+                                    {playlist.description ? ` · ${playlist.description}` : ''}
                                 </div>
-                                {playlist.description && (
-                                    <div className="text-sm text-fg-tertiary truncate">
-                                        {playlist.description}
-                                    </div>
-                                )}
                             </div>
-                            {activeTab === 'mine' && (
+                            {isMine(playlist) && (
                                 <button
                                     type="button"
                                     className="flex items-center justify-center w-8 h-8 bg-transparent border border-border-primary text-fg-tertiary cursor-pointer shrink-0 transition-all duration-150 hover:text-error hover:border-error"

@@ -40,7 +40,15 @@ impl Rpc {
         let rpc = Arc::new(Rpc {
             out,
             pending: Default::default(),
-            next_id: AtomicU64::new(1),
+            // The backend fans every Mopidy reply out to all clients; start far away from
+            // the browsers' small ids so a foreign reply never matches one of ours.
+            next_id: AtomicU64::new(
+                1_000_000
+                    * (1 + std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64 % 4_000_000)
+                        .unwrap_or(7)),
+            ),
             token: Arc::new(Mutex::new(token)),
         });
         tokio::spawn(run(
@@ -96,9 +104,14 @@ async fn run(
             Some(t) => format!("{ws_url}?token={t}"),
             None => ws_url.clone(),
         };
+        debug(&format!(
+            "connecting {}",
+            url.split('?').next().unwrap_or("")
+        ));
         let ws = match tokio_tungstenite::connect_async(&url).await {
             Ok((ws, _)) => ws,
-            Err(_) => {
+            Err(e) => {
+                debug(&format!("connect failed: {e}"));
                 let _ = events.send(Incoming::Disconnected);
                 // Drain control messages while down so a Reconnect does not pile up.
                 let _ = tokio::time::timeout(Duration::from_secs(backoff), out_rx.recv()).await;
@@ -113,6 +126,7 @@ async fn run(
             tokio::select! {
                 out = out_rx.recv() => match out {
                     Some(Outgoing::Text(t)) => {
+                        debug(&format!("-> {}", &t[..t.len().min(300)]));
                         if sink.send(Message::Text(t.into())).await.is_err() { break; }
                     }
                     Some(Outgoing::Reconnect) => { let _ = sink.close().await; break; }
@@ -125,12 +139,14 @@ async fn run(
                 },
             }
         }
+        debug("socket closed");
         fail_all(&pending);
         let _ = events.send(Incoming::Disconnected);
     }
 }
 
 fn dispatch(text: &str, pending: &Pending, events: &mpsc::UnboundedSender<Incoming>) {
+    debug(&format!("<- {}", &text[..text.len().min(200)]));
     let Ok(v) = serde_json::from_str::<Value>(text) else {
         return;
     };
@@ -149,5 +165,18 @@ fn dispatch(text: &str, pending: &Pending, events: &mpsc::UnboundedSender<Incomi
         }
     } else if v.get("event").is_some() || v.get("error").is_some() {
         let _ = events.send(Incoming::Event(v));
+    }
+}
+
+fn debug(line: &str) {
+    if let Ok(path) = std::env::var("MUSAKONE_DEBUG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{line}");
+        }
     }
 }

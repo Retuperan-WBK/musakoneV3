@@ -1,5 +1,4 @@
 /// FFI bindings for Erlang's gun WebSocket client library
-
 /// WebSocket connection handle (ConnPid + StreamRef)
 pub type Connection
 

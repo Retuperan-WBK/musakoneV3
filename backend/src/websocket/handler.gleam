@@ -192,15 +192,22 @@ fn handle_message(
     mist.Custom(event) -> {
       let new_state = case event {
         event_bus.MessageReceived(data) -> {
-          logging.log(logging.Debug, "Backend -> Browser: " <> data)
-          case mist.send_text_frame(conn, data) {
-            Ok(_) -> Nil
-            Error(err) -> {
-              logging.log(
-                logging.Error,
-                "Failed to send to browser: " <> string.inspect(err),
-              )
+          // Every client shares one Mopidy connection, so replies reach every handler.
+          // Forward events to everyone, but a reply only to the connection that asked.
+          case tracker.owns_response(state.context, data) {
+            True -> {
+              logging.log(logging.Debug, "Backend -> Browser: " <> data)
+              case mist.send_text_frame(conn, data) {
+                Ok(_) -> Nil
+                Error(err) -> {
+                  logging.log(
+                    logging.Error,
+                    "Failed to send to browser: " <> string.inspect(err),
+                  )
+                }
+              }
             }
+            False -> Nil
           }
           // Update playback context from Mopidy events
           let new_ctx = tracker.update_context(state.context, data)

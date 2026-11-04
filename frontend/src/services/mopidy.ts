@@ -6,7 +6,6 @@
 import { setConnectionStatus } from '../stores/connection';
 import { setPlaybackOptions, updatePlaybackState } from '../stores/player';
 import { setQueue } from '../stores/queue';
-import { showToast } from '../stores/toast';
 import type { Album, Artist, QueueTrack, Track } from '../types';
 import { getToken } from './auth';
 import { getConfigSync } from './config';
@@ -286,13 +285,6 @@ class MopidyWebSocket {
             case 'options_changed':
                 this.getPlaybackOptions().then(setPlaybackOptions).catch(console.error);
                 break;
-
-            case 'autoplay_added': {
-                // Synthetic event from the backend's autoplay actor
-                const count = typeof event.count === 'number' ? event.count : 0;
-                showToast(`Autoplay added ${count} ${count === 1 ? 'track' : 'tracks'}`, 'info');
-                break;
-            }
 
             case 'volume_changed':
                 if (event.volume !== undefined) {

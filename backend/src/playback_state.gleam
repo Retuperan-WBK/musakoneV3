@@ -59,7 +59,12 @@ type PendingAttribution {
 
 /// Per-user listening session state (in-memory)
 type SessionState {
-  SessionState(session_id: Int, started_ms: Int, last_activity_ms: Int, track_count: Int)
+  SessionState(
+    session_id: Int,
+    started_ms: Int,
+    last_activity_ms: Int,
+    track_count: Int,
+  )
 }
 
 /// Internal actor state
@@ -189,7 +194,8 @@ fn handle_message(
     MopidyEventReceived(event) -> handle_mopidy_event(state, event)
 
     AttributeCommand(user_id, method, ts) -> {
-      let attr = PendingAttribution(user_id: user_id, method: method, timestamp_ms: ts)
+      let attr =
+        PendingAttribution(user_id: user_id, method: method, timestamp_ms: ts)
       let new_pending = [attr, ..state.pending_attributions]
       actor.continue(State(..state, pending_attributions: new_pending))
     }
@@ -214,16 +220,17 @@ fn handle_mopidy_event(
       let new_ctx = tracker.update_context(state.context, data)
 
       // Check if this is a state-changing event and log it
-      let new_state = process_state_change(
-        State(..state, context: new_ctx),
-        data,
-      )
+      let new_state =
+        process_state_change(State(..state, context: new_ctx), data)
 
       actor.continue(new_state)
     }
 
     event_bus.Connected -> {
-      logging.log(logging.Info, "Playback state actor: Mopidy connected, querying initial state")
+      logging.log(
+        logging.Info,
+        "Playback state actor: Mopidy connected, querying initial state",
+      )
       actor.continue(query_initial_state(state))
     }
 
@@ -267,34 +274,6 @@ fn rpc_message(id: Int, method: String) -> String {
   |> json.to_string
 }
 
-/// Remember artist name -> URI pairs from a track_playback_started event, so the
-/// recommender can browse an artist's catalogue by name later.
-fn index_artists(db: sqlight.Connection, raw: String) -> Nil {
-  let artists_decoder =
-    decode.at(
-      ["tl_track", "track", "artists"],
-      decode.list({
-        use uri <- decode.optional_field("uri", "", decode.string)
-        use name <- decode.optional_field("name", "", decode.string)
-        decode.success(#(name, uri))
-      }),
-    )
-  case json.parse(raw, artists_decoder) {
-    Ok(artists) ->
-      list.each(artists, fn(artist) {
-        case artist.0 != "" && artist.1 != "" {
-          True -> {
-            let _ =
-              queries.upsert_artist_index(db, artist.0, artist.1, now_ms())
-            Nil
-          }
-          False -> Nil
-        }
-      })
-    Error(_) -> Nil
-  }
-}
-
 // ─── State change detection and logging ────────────────────────────
 
 /// Check if a Mopidy message represents a loggable state change.
@@ -308,10 +287,6 @@ fn process_state_change(state: State, raw: String) -> State {
       prune_attributions(state)
     }
     Some(etype) -> {
-      case etype == "track_started" {
-        True -> index_artists(state.db, raw)
-        False -> Nil
-      }
       // Volume debouncing: skip if too recent
       case etype == "volume" {
         True -> {
@@ -330,7 +305,10 @@ fn process_state_change(state: State, raw: String) -> State {
             True -> {
               let id = state.next_request_id
               let msg = rpc_message(id, "core.tracklist.get_tl_tracks")
-              event_bus.send_command(state.event_bus, event_bus.SendMessage(msg))
+              event_bus.send_command(
+                state.event_bus,
+                event_bus.SendMessage(msg),
+              )
               let state =
                 State(
                   ..state,
@@ -397,7 +375,11 @@ fn log_state_change(state: State, event_type: String) -> State {
   // person who put it in the queue, otherwise no listening data ever accrues.
   let #(explicit_user, remaining_attrs) =
     find_attribution(state.pending_attributions, event_type, now)
-  let user_id = case explicit_user, is_track_start || is_track_end, ctx.track_uri {
+  let user_id = case
+    explicit_user,
+    is_track_start || is_track_end,
+    ctx.track_uri
+  {
     None, True, Some(uri) ->
       queries.find_queued_by(state.db, uri) |> result.unwrap(None)
     _, _, _ -> explicit_user
@@ -541,9 +523,8 @@ fn matching_methods(event_type: String) -> List(String) {
     "seeked" -> ["core.playback.seek"]
     "volume" -> ["core.mixer.set_volume"]
     "tracklist_changed" -> [
-      "core.tracklist.add", "core.tracklist.remove",
-      "core.tracklist.clear", "core.tracklist.shuffle",
-      "core.tracklist.move",
+      "core.tracklist.add", "core.tracklist.remove", "core.tracklist.clear",
+      "core.tracklist.shuffle", "core.tracklist.move",
     ]
     _ -> []
   }
@@ -610,11 +591,14 @@ fn manage_session(state: State, user_id: Int, now: Int) -> State {
         }
         False -> {
           // Update last activity
-          let updated =
-            SessionState(..session, last_activity_ms: now)
+          let updated = SessionState(..session, last_activity_ms: now)
           State(
             ..state,
-            active_sessions: dict.insert(state.active_sessions, user_id, updated),
+            active_sessions: dict.insert(
+              state.active_sessions,
+              user_id,
+              updated,
+            ),
           )
         }
       }
@@ -668,10 +652,7 @@ fn close_user_session(
       session.track_count,
       None,
     )
-  State(
-    ..state,
-    active_sessions: dict.delete(state.active_sessions, user_id),
-  )
+  State(..state, active_sessions: dict.delete(state.active_sessions, user_id))
 }
 
 fn increment_session_track_count(state: State, user_id: Int) -> State {

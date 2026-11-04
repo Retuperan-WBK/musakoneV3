@@ -67,7 +67,9 @@ export function getConfigSync(): AppConfig {
  * With no base configured, fall back to the page's host on port 3001, matching the page's scheme so an
  * HTTPS deployment never attempts a mixed-content http:// or ws:// request (browsers block those outright).
  */
-export function resolveBackendUrls(base: string | undefined): Pick<AppConfig, 'backendHttpUrl' | 'backendWsUrl'> {
+export function resolveBackendUrls(
+    base: string | undefined
+): Pick<AppConfig, 'backendHttpUrl' | 'backendWsUrl'> {
     const httpUrl = (base && base.trim()) || getDefaultBackendUrl();
     const backendHttpUrl = httpUrl.replace(/\/+$/, '');
     const backendWsUrl = `${backendHttpUrl.replace(/^http/i, 'ws')}/ws`;

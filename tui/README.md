@@ -17,14 +17,22 @@ background on start and tells you to restart; `musakone update` does it on deman
     musakone                       # backend from ~/.config/musakone/url, default http://10.0.1.2:3001
     musakone https://mb.rwbk.fi    # use and remember another backend
 
-First start asks for your musakone username and password; the token is kept in
-`~/.config/musakone/token`. Esc skips login (anonymous plays, no playlists).
+Login: put `MUSAKONE_USER` and `MUSAKONE_PASSWORD` in the environment or in
+`~/.config/musakone/env` (KEY=VALUE lines) and the client logs in by itself; otherwise it
+asks once and keeps the token in `~/.config/musakone/token`. `L` switches user.
 
-## Keys
+## Screens and keys
 
-Press `1` or `F1` inside the app. Same as ncmpcpp where there is an equivalent:
-`2` queue, `3` browse, `4` search, `6` playlist editor, `l` lyrics, `5` Mix
-(recommendations and autoplay, replaces ncmpcpp's media library).
+ncmpcpp's defaults: `F1` help, `1` playlist (columns Artist/Track/Title/Album/Time),
+`2` browser, `3` search engine (the constraint form), `4` media library (Tidal favourite
+artists + local library, three columns), `5` playlist editor (the room's shared playlists;
+you edit your own), `l` lyrics (lrclib.net, synced lines follow the song), `Tab` flips
+playlist/browser. Playback `p s > < f b`, volume `Left Right + -`, modes `r z y R`,
+`Space` select, `a` add selected to..., `S` save queue as playlist, `/ . ,` find, `g`
+jump to position, `o` go to playing song, `c`/`C` clear/crop, `q` quit. `j`/`k` also move.
+
+Colours follow ncmpcpp's default config (yellow main window, yellow-reverse cursor,
+green/white/cyan/magenta columns, green progress bar).
 
 ## Build
 
