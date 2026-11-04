@@ -65,6 +65,11 @@ pub type PlaybackContext {
     last_search_query: Option(String),
     /// Timestamp of last search (for 30s conversion window)
     last_search_timestamp_ms: Option(Int),
+    /// Track uris of the last search reply, in result order (for result_position)
+    last_search_results: List(String),
+    /// Last logged tracklist.add (uris json, time) to drop double submits
+    last_add_uris: Option(String),
+    last_add_ms: Int,
   )
 }
 
@@ -90,6 +95,9 @@ pub fn empty_context() -> PlaybackContext {
     uri_names: dict.new(),
     last_search_query: None,
     last_search_timestamp_ms: None,
+    last_search_results: [],
+    last_add_uris: None,
+    last_add_ms: 0,
   )
 }
 
@@ -121,6 +129,37 @@ pub fn owns_response(ctx: PlaybackContext, raw: String) -> Bool {
   case json.parse(raw, id_decoder) {
     Ok(id) -> dict.has_key(ctx.pending_requests, id)
     Error(_) -> True
+  }
+}
+
+/// Number of tracks in a core.library.search reply this connection is waiting for.
+pub fn search_result_count(ctx: PlaybackContext, raw: String) -> Option(Int) {
+  let id_decoder = {
+    use id <- decode.field("id", decode.int)
+    decode.success(id)
+  }
+  case json.parse(raw, id_decoder) {
+    Ok(id) ->
+      case dict.get(ctx.pending_requests, id) {
+        Ok("core.library.search") -> {
+          let tracks_decoder =
+            decode.at(
+              ["result"],
+              decode.list(decode.optionally_at(
+                ["tracks"],
+                [],
+                decode.list(decode.dynamic),
+              )),
+            )
+          case json.parse(raw, tracks_decoder) {
+            Ok(per_backend) ->
+              Some(list.fold(per_backend, 0, fn(n, t) { n + list.length(t) }))
+            Error(_) -> Some(0)
+          }
+        }
+        _ -> None
+      }
+    Error(_) -> None
   }
 }
 
@@ -314,7 +353,11 @@ fn update_from_response(
             list.fold(names, ctx.uri_names, fn(acc, pair) {
               dict.insert(acc, pair.0, pair.1)
             })
-          PlaybackContext(..ctx, uri_names: new_map)
+          PlaybackContext(
+            ..ctx,
+            uri_names: new_map,
+            last_search_results: extract_search_track_uris(raw),
+          )
         }
 
         "core.library.lookup" -> {
@@ -503,18 +546,28 @@ fn handle_command(
           }
         }
       }
-      log_queue(
-        db,
-        user_id,
-        now,
-        event_type,
-        uris,
-        track_names,
-        at_pos,
-        relative_pos,
-        None,
-        Some(queue_len),
-      )
+      // The same uris again within 1.5 s is a double submit, not a second add
+      let duplicate =
+        uris != None
+        && uris == ctx.last_add_uris
+        && now - ctx.last_add_ms < 1500
+      case duplicate {
+        True -> Nil
+        False ->
+          log_queue(
+            db,
+            user_id,
+            now,
+            event_type,
+            uris,
+            track_names,
+            at_pos,
+            relative_pos,
+            None,
+            Some(queue_len),
+          )
+      }
+      let ctx = PlaybackContext(..ctx, last_add_uris: uris, last_add_ms: now)
 
       // Queue affinity: update for each added URI
       list.each(uri_list, fn(uri) {
@@ -529,25 +582,31 @@ fn handle_command(
           let elapsed = now - search_ts
           case elapsed <= 30_000 {
             True -> {
-              // Log conversion for each URI that was in search results
-              list.each(uri_list, fn(uri) {
-                case dict.get(ctx.uri_names, uri) {
-                  Ok(_) -> {
-                    let _ =
-                      queries.log_search_conversion(
-                        db,
-                        user_id,
-                        now,
-                        Some(query),
-                        Some(uri),
-                        "add",
-                        Some(elapsed),
-                      )
-                    Nil
-                  }
-                  Error(_) -> Nil
+              // One conversion row per add (not per uri): the first uri's rank
+              // in the last result list says what the person picked.
+              let first = list.first(uri_list) |> option.from_result
+              let position =
+                option.then(first, fn(u) {
+                  position_in(ctx.last_search_results, u) |> option.from_result
+                })
+              case option.map(first, dict.has_key(ctx.uri_names, _)) {
+                Some(True) -> {
+                  let _ =
+                    queries.log_search_conversion(
+                      db,
+                      user_id,
+                      now,
+                      Some(query),
+                      first,
+                      position,
+                      list.length(uri_list),
+                      "add",
+                      Some(elapsed),
+                    )
+                  Nil
                 }
-              })
+                _ -> Nil
+              }
               ctx
             }
             False -> ctx
@@ -1062,6 +1121,29 @@ fn extract_ref_names(raw: String) -> List(#(String, String)) {
 
 /// Extract (uri, name) pairs from a core.library.search response.
 /// Response: {"result": [{"tracks": [...], "artists": [...], "albums": [...]}, ...]}
+/// 1-based index of `uri` in `items`
+fn position_in(items: List(String), uri: String) -> Result(Int, Nil) {
+  list.index_map(items, fn(u, i) { #(u, i + 1) })
+  |> list.key_find(uri)
+}
+
+/// Track uris of a core.library.search reply, in the order Mopidy returned them
+fn extract_search_track_uris(raw: String) -> List(String) {
+  let decoder =
+    decode.at(
+      ["result"],
+      decode.list(decode.optionally_at(
+        ["tracks"],
+        [],
+        decode.list(decode.at(["uri"], decode.string)),
+      )),
+    )
+  case json.parse(raw, decoder) {
+    Ok(per_backend) -> list.flatten(per_backend)
+    Error(_) -> []
+  }
+}
+
 fn extract_search_result_names(raw: String) -> List(#(String, String)) {
   // Tracks: [{uri, name, artists: [{name}]}]
   let track_decoder = {

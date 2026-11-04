@@ -14,6 +14,7 @@ import gleam/result
 import gleam/string
 import gleam/uri
 import handlers/http as http_handlers
+import handlers/stats as stats_handlers
 import logging
 import mist
 import playback_state
@@ -216,6 +217,37 @@ fn handle_request(
 
           http_handlers.get_user_affinities(state, auth_header, limit)
           |> with_cors
+        }
+        Error(e) -> error_response(e, 401) |> with_cors
+      }
+    }
+
+    // Stats: room-wide, per-user, and today's play counts for queue badges
+    http.Get, ["api", "stats", "room"] -> {
+      case get_auth_header(req) {
+        Ok(auth_header) -> {
+          let #(days, tz) = stats_params(req)
+          stats_handlers.room(state, auth_header, days, tz) |> with_cors
+        }
+        Error(e) -> error_response(e, 401) |> with_cors
+      }
+    }
+
+    http.Get, ["api", "stats", "me"] -> {
+      case get_auth_header(req) {
+        Ok(auth_header) -> {
+          let #(days, tz) = stats_params(req)
+          stats_handlers.me(state, auth_header, days, tz) |> with_cors
+        }
+        Error(e) -> error_response(e, 401) |> with_cors
+      }
+    }
+
+    http.Get, ["api", "stats", "today"] -> {
+      case get_auth_header(req) {
+        Ok(auth_header) -> {
+          let #(_, tz) = stats_params(req)
+          stats_handlers.today(state, auth_header, tz) |> with_cors
         }
         Error(e) -> error_response(e, 401) |> with_cors
       }
@@ -528,4 +560,16 @@ fn error_response(message: String, status: Int) -> Response(mist.ResponseData) {
   |> response.set_body(
     mist.Bytes(bytes_tree.from_string("{\"error\":\"" <> message <> "\"}")),
   )
+}
+
+/// ?days=30 (0 = all time, default 30) and ?tz=120 (browser offset, minutes east of UTC)
+fn stats_params(req: Request(mist.Connection)) -> #(Int, Int) {
+  let params =
+    req.query |> option.unwrap("") |> uri.parse_query |> result.unwrap([])
+  let get = fn(key, default) {
+    list.key_find(params, key)
+    |> result.try(int.parse)
+    |> result.unwrap(default)
+  }
+  #(int.clamp(get("days", 30), 0, 3650), int.clamp(get("tz", 0), -840, 840))
 }

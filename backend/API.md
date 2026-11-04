@@ -120,6 +120,20 @@ Endpoints require `Authorization: Bearer <token>`.
   `{ "track_uri" }`, `PUT /api/playlists/:id/tracks/reorder` `{ "track_uri", "new_position" }` — owner only
 - `GET /api/playlists/containing?track_uri=…` — ids of the caller's playlists holding the track
 
+## Stats (analytics)
+
+Computed on demand from `playback_state_log` (what the speakers actually did, wall-clock
+heard time, not the unreliable `position_ms`) and `queue_events` / `search_events`.
+All require `Authorization: Bearer <token>`. Query params: `days` (7, 30, or 0 = all time;
+default 30) and `tz` (browser offset in minutes east of UTC).
+
+- `GET /api/stats/room` — totals, per-day, by-hour, by-weekday, top tracks/artists,
+  decades, repeat-o-meter, DJs (by tracks actually heard), queue health, skips, and a
+  search funnel (conversion, pick rank, backend split, most/zero-result/lost queries).
+- `GET /api/stats/me` — the caller's plays, queue heard-rate, DJ rank, top artists/tracks,
+  kindred users (overlapping queued artists). Per-user attribution is reliable from 2026-09.
+- `GET /api/stats/today?tz=` — `{ "<uri>": plays_today }`, for "played N× today" badges.
+
 ## WebSocket
 
 ### `WS /ws`

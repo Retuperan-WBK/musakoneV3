@@ -313,7 +313,13 @@ fn draw_statusbar(f: &mut Frame, area: Rect, app: &App) {
             ])),
             area,
         );
-        let x = area.x + (p.label.width() + shown.width()) as u16;
+        // Cursor at its byte offset within the (possibly masked) buffer
+        let before = if p.masked {
+            "*".repeat(p.buf[..p.cursor].chars().count())
+        } else {
+            p.buf[..p.cursor].to_string()
+        };
+        let x = area.x + (p.label.width() + before.width()) as u16;
         f.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
         return;
     }
@@ -766,19 +772,37 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
                 "Search"
             }),
             SeItem::Reset => Row::text("Reset"),
-            SeItem::Results(n) => Row {
-                spans: vec![
-                    Span::styled("Search results: ", bold),
-                    Span::raw(format!(
-                        "Found {n} {}",
-                        if *n == 1 { "song" } else { "songs" }
-                    )),
-                ],
-                right: vec![],
-                sep: false,
-                bold: false,
-            },
+            SeItem::Results => {
+                // Tab bar like the web UI: songs | artists | albums, active one reversed
+                let mut spans = vec![Span::styled("Search results: ", bold)];
+                let tabs = [
+                    format!(" Songs {} ", app.se_tracks.len()),
+                    format!(" Artists {} ", app.se_artists.len()),
+                    format!(" Albums {} ", app.se_albums.len()),
+                ];
+                for (i, t) in tabs.iter().enumerate() {
+                    let st = if i == app.se_tab {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+                    spans.push(Span::styled(t.clone(), st));
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(
+                    "(Left/Right to switch)",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                Row {
+                    spans,
+                    right: vec![],
+                    sep: false,
+                    bold: false,
+                }
+            }
             SeItem::Song(t) => Row::song(t, app.queue_uris.contains(&t.uri)),
+            SeItem::Artist(r) => Row::text(r.name.clone()),
+            SeItem::Album(r) => Row::text(format!("[{}]", r.name)),
         },
     );
 }

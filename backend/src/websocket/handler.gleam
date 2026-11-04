@@ -2,6 +2,7 @@
 /// Subscribes to event bus for Mopidy events, sends commands through event bus
 /// Tracks all user actions to the database for ML training
 import auth/jwt
+import db/queries
 import db/tracker
 import event_bus.{type BusMessage, type MopidyEvent}
 import gleam/erlang/process.{type Subject}
@@ -208,6 +209,13 @@ fn handle_message(
               }
             }
             False -> Nil
+          }
+          case state.user_id, tracker.search_result_count(state.context, data) {
+            Some(uid), Some(n) -> {
+              let _ = queries.set_last_search_result_count(state.db, uid, n)
+              Nil
+            }
+            _, _ -> Nil
           }
           // Update playback context from Mopidy events
           let new_ctx = tracker.update_context(state.context, data)
