@@ -22,7 +22,7 @@ pub enum Screen {
     Library,
     Editor,
     Lyrics,
-    Cover,
+    Stats,
 }
 
 /// NC::Menu: a cursor over items, classic (non-centred) scrolling, per-item selection.
@@ -236,6 +236,7 @@ pub enum Msg {
     Lyrics(String, Lyrics),
     /// Album-art bytes for a track uri (None = no art / fetch failed)
     Cover(String, Option<Vec<u8>>),
+    Stats(Value),
     Info(String),
     Error(String),
     Nothing,
@@ -356,14 +357,20 @@ pub struct App {
     pub lyrics_follow: bool,
     pub help_offset: usize,
     /// Decoded album art for the current track (uri, image)
-    pub cover: Option<(String, image::DynamicImage)>,
-    cover_loading: Option<String>,
-    pub cover_failed: Option<String>,
+    /// Album art per track uri: Some(img) = decoded, None = fetched but no art.
+    pub art_cache: std::collections::HashMap<String, Option<image::DynamicImage>>,
+    art_loading: HashSet<String>,
+    /// Stats screen: fetched payload, scope "room"/"me", window days (7/30/0), scroll.
+    pub stats: Option<Value>,
+    stats_loading: bool,
+    pub stats_scope: &'static str,
+    pub stats_days: u32,
+    pub stats_offset: usize,
 
     pub prompt: Option<Prompt>,
     pub popup: Option<Popup>,
     /// Song-info overlay (ncmpcpp `i`): label/value pairs, any key closes it
-    pub info: Option<Vec<(String, String)>>,
+    pub info: Option<(String, Vec<(String, String)>)>,
     pub message: Option<(String, Instant)>,
     find: String,
     /// First endpoint of a Ctrl-V select-range (set on the first press)
@@ -447,9 +454,13 @@ impl App {
             lyrics_offset: 0,
             lyrics_follow: true,
             help_offset: 0,
-            cover: None,
-            cover_loading: None,
-            cover_failed: None,
+            art_cache: std::collections::HashMap::new(),
+            art_loading: HashSet::new(),
+            stats: None,
+            stats_loading: false,
+            stats_scope: "room",
+            stats_days: 30,
+            stats_offset: 0,
             prompt: None,
             popup: None,
             info: None,
@@ -1181,23 +1192,70 @@ impl App {
 
     // ---------- lyrics ----------
 
-    /// Fetch and decode the current track's album art (Mopidy get_images → URL → bytes).
-    fn ensure_cover(&mut self) {
-        let Some(uri) = self.current.as_ref().map(|c| c.track.uri.clone()) else {
-            return;
-        };
-        if self.cover.as_ref().map(|(u, _)| u) == Some(&uri)
-            || self.cover_loading.as_ref() == Some(&uri)
-            || self.cover_failed.as_ref() == Some(&uri)
-        {
+    /// Prefetch art for the song under the search cursor (for the preview panel).
+    fn ensure_search_art(&mut self) {
+        if self.screen != Screen::Search {
             return;
         }
-        self.cover_loading = Some(uri.clone());
+        if let Some(SeItem::Song(t)) = self.se.cur() {
+            let uri = t.uri.clone();
+            self.ensure_art(uri);
+        }
+    }
+
+    /// Fetch the stats payload for the current scope/window if not already loaded.
+    fn ensure_stats(&mut self) {
+        if self.stats.is_some() || self.stats_loading {
+            return;
+        }
+        self.stats_loading = true;
+        let api = self.api.clone();
+        let (scope, days) = (self.stats_scope, self.stats_days);
+        self.task(async move { Ok(Msg::Stats(api.stats(scope, days).await?)) });
+    }
+
+    fn reload_stats(&mut self) {
+        self.stats = None;
+        self.stats_loading = false;
+        self.stats_offset = 0;
+        self.ensure_stats();
+    }
+
+    /// Left/Right on the stats screen cycles the time window 7d -> 30d -> all.
+    fn cycle_stats_range(&mut self, dir: isize) {
+        let order = [7u32, 30, 0];
+        let i = order
+            .iter()
+            .position(|d| *d == self.stats_days)
+            .unwrap_or(1) as isize;
+        self.stats_days = order[(i + dir).rem_euclid(order.len() as isize) as usize];
+        self.reload_stats();
+    }
+
+    fn toggle_stats_scope(&mut self) {
+        self.stats_scope = if self.stats_scope == "room" {
+            "me"
+        } else {
+            "room"
+        };
+        self.reload_stats();
+    }
+
+    /// Fetch and decode a track's album art into art_cache (Mopidy get_images → URL → bytes).
+    fn ensure_art(&mut self, uri: String) {
+        if self.art_cache.contains_key(&uri) || self.art_loading.contains(&uri) {
+            return;
+        }
+        // Keep the cache bounded; a session won't hover thousands of tracks.
+        if self.art_cache.len() > 64 {
+            self.art_cache.clear();
+        }
+        self.art_loading.insert(uri.clone());
         let rpc = self.rpc.clone();
         let api = self.api.clone();
         self.task(async move {
             let v = rpc
-                .call("core.library.get_images", json!({ "uris": [uri] }))
+                .call("core.library.get_images", json!({ "uris": [uri.clone()] }))
                 .await?;
             // result: { uri: [ { uri, width, height }, ... ] } — take the largest image.
             let best = v
@@ -1210,13 +1268,9 @@ impl App {
                         .and_then(|i| i.get("uri").and_then(Value::as_str))
                         .map(String::from)
                 });
-            let key = v
-                .as_object()
-                .and_then(|m| m.keys().next().cloned())
-                .unwrap_or_default();
             match best {
-                Some(url) => Ok(Msg::Cover(key, Some(api.fetch_bytes(&url).await?))),
-                None => Ok(Msg::Cover(key, None)),
+                Some(url) => Ok(Msg::Cover(uri, Some(api.fetch_bytes(&url).await?))),
+                None => Ok(Msg::Cover(uri, None)),
             }
         });
     }
@@ -1275,8 +1329,11 @@ impl App {
         if self.screen == Screen::Lyrics {
             self.ensure_lyrics();
         }
-        if self.screen == Screen::Cover {
-            self.ensure_cover();
+        if self.screen == Screen::Stats {
+            self.ensure_stats();
+        }
+        if self.screen == Screen::Search {
+            self.ensure_search_art();
         }
     }
 
@@ -1524,16 +1581,13 @@ impl App {
                 }
             }
             Msg::Cover(uri, bytes) => {
-                if self.cover_loading.as_ref() == Some(&uri) {
-                    self.cover_loading = None;
-                }
-                match bytes.and_then(|b| image::load_from_memory(&b).ok()) {
-                    Some(img) => {
-                        self.cover = Some((uri, img));
-                        self.cover_failed = None;
-                    }
-                    None => self.cover_failed = Some(uri),
-                }
+                self.art_loading.remove(&uri);
+                let img = bytes.and_then(|b| image::load_from_memory(&b).ok());
+                self.art_cache.insert(uri, img);
+            }
+            Msg::Stats(v) => {
+                self.stats_loading = false;
+                self.stats = Some(v);
             }
         }
     }
@@ -1571,7 +1625,7 @@ impl App {
             K::Char('3') => self.goto(Screen::Search),
             K::Char('4') => self.goto(Screen::Library),
             K::Char('5') => self.goto(Screen::Editor),
-            K::Char('6') => self.goto(Screen::Cover),
+            K::Char('6') => self.goto(Screen::Stats),
             K::Char('l') => {
                 if self.screen == Screen::Lyrics {
                     self.goto(self.prev_screen);
@@ -1597,6 +1651,8 @@ impl App {
             K::Char('<') => self.rpc_fire("core.playback.previous", json!({})),
             K::Char('f') => self.seek(1),
             K::Char('b') => self.seek(-1),
+            K::Left if self.screen == Screen::Stats => self.cycle_stats_range(-1),
+            K::Right if self.screen == Screen::Stats => self.cycle_stats_range(1),
             K::Right if columns => self.next_column(1),
             K::Left if columns => self.next_column(-1),
             K::Right | K::Char('+') => self.set_volume(self.volume + VOL_STEP),
@@ -1634,6 +1690,7 @@ impl App {
                     self.rpc_fire("core.tracklist.remove", json!({"criteria": {"tlid": rm}}));
                 }
             }
+            K::Char('u') if self.screen == Screen::Stats => self.reload_stats(),
             K::Char('u') => {
                 self.rpc_fire("core.library.refresh", json!({}));
                 self.browse_cache.clear();
@@ -1722,8 +1779,8 @@ impl App {
             self.lyrics_follow = true;
             self.ensure_lyrics();
         }
-        if s == Screen::Cover {
-            self.ensure_cover();
+        if s == Screen::Stats {
+            self.ensure_stats();
         }
         if s == Screen::Library
             && self.lib_artists.is_empty()
@@ -1831,7 +1888,7 @@ impl App {
                         .collect()
                 }
             }
-            Screen::Lyrics | Screen::Help | Screen::Cover => vec![],
+            Screen::Lyrics | Screen::Help | Screen::Stats => vec![],
         }
     }
 
@@ -1917,7 +1974,8 @@ impl App {
             v.push(("Length".into(), t.duration()));
         }
         v.push(("URI".into(), t.uri.clone()));
-        self.info = Some(v);
+        self.ensure_art(t.uri.clone());
+        self.info = Some((t.uri, v));
     }
 
     /// ncmpcpp Ctrl-V: first press sets an endpoint, second selects the range.
@@ -2112,7 +2170,10 @@ impl App {
         match self.screen {
             Screen::Playlist => self.queue.fix_offset(),
             Screen::Browser => self.browser.fix_offset(),
-            Screen::Search => self.se.fix_offset(),
+            Screen::Search => {
+                self.se.fix_offset();
+                self.ensure_search_art();
+            }
             Screen::Library => match self.lib_col {
                 0 => {
                     self.lib_artists.fix_offset();
@@ -2134,7 +2195,7 @@ impl App {
                 }
             }
             Screen::Lyrics => self.lyrics_follow = false,
-            Screen::Help | Screen::Cover => {}
+            Screen::Help | Screen::Stats => {}
         }
     }
 
@@ -2158,6 +2219,11 @@ impl App {
                 self.help_offset = (self.help_offset as isize + d * step)
                     .clamp(0, crate::ui::help_len() as isize - 1)
                     as usize;
+                return;
+            }
+            Screen::Stats => {
+                let step = if page { 10 } else { 1 };
+                self.stats_offset = (self.stats_offset as isize + d * step).max(0) as usize;
                 return;
             }
             _ => {}
@@ -2226,7 +2292,14 @@ impl App {
             Screen::Search => self.search_key(k),
             Screen::Library => self.library_key(k),
             Screen::Editor => self.editor_key(k),
-            Screen::Lyrics | Screen::Help | Screen::Cover => {}
+            Screen::Stats => {
+                // Space or Tab-like toggles room/me; u refreshes.
+                match k.code {
+                    K::Char(' ') | K::Enter => self.toggle_stats_scope(),
+                    _ => {}
+                }
+            }
+            Screen::Lyrics | Screen::Help => {}
         }
     }
 

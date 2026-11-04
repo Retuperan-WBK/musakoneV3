@@ -26,10 +26,10 @@ asks once and keeps the token in `~/.config/musakone/token`. `L` switches user.
 ncmpcpp's defaults: `F1` help, `1` playlist (columns Artist/Track/Title/Album/Time),
 `2` browser, `3` search engine (the constraint form), `4` media library (Tidal favourite
 artists + local library, three columns), `5` playlist editor (the room's shared playlists;
-you edit your own), `6` album art (cover rendered in the terminal), `l` lyrics (lrclib.net,
+you edit your own), `6` stats (room / your listening stats), `l` lyrics (lrclib.net,
 synced lines follow the song), `Tab` flips playlist/browser. Playback `p s > < f b`, volume `Left Right + -`, modes `r z y R`,
 `Space` select, `a` add selected to..., `S` save queue as playlist, `/ . ,` find, `g`
-jump to position, `o` go to playing song, `c`/`C` clear/crop, `i` song info, `B` select album, `Ctrl-V` select range, `[`/`]` and
+jump to position, `o` go to playing song, `c`/`C` clear/crop, `i` song info (with album art), `B` select album, `Ctrl-V` select range, `[`/`]` and
 `{`/`}` jump by album/artist, `q` quit. `j`/`k` also move.
 
 Colours follow ncmpcpp's default config (yellow main window, yellow-reverse cursor,
@@ -38,3 +38,14 @@ green/white/cyan/magenta columns, green progress bar).
 ## Build
 
     cd tui && cargo build --release    # target/release/musakone
+
+## Album art and terminals
+
+Song info (`i`) and the search preview show the track's album art. On a truecolor
+terminal it renders in colour (half-blocks); on the Linux text console it falls back to
+luminance ASCII automatically. Force it with `MUSAKONE_ASCII=1` (ASCII) or `=0` (colour).
+
+## Stats
+
+`6` shows room or personal listening stats from the backend. `←`/`→` change the window
+(7d / 30d / all), `Space` toggles room/you, `u` refreshes, `j`/`k` scroll.

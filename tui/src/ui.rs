@@ -14,6 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const MAIN: Color = Color::Red; // main_window_color = red
 const EMPTY_TAG: Color = Color::Red; // empty_tag_color = red
 const SELECTED: Color = Color::Magenta; // selected_item_prefix $6
+const NOW: Color = Color::Yellow; // now-playing row colour (color2), bold on top
 const PROGRESS: Color = Color::DarkGray; // progressbar_color black:b
 const PROGRESS_ELAPSED: Color = Color::Green; // progressbar_elapsed_color
 const STATUSBAR: Color = Color::Yellow; // statusbar_color = yellow
@@ -113,20 +114,20 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Library => draw_library(f, main, app),
         Screen::Editor => draw_editor(f, main, app),
         Screen::Lyrics => draw_lyrics(f, main, app),
-        Screen::Cover => draw_cover(f, main, app),
+        Screen::Stats => draw_stats(f, main, app),
     }
     draw_progress(f, bar, app);
     draw_statusbar(f, status, app);
     if let Some(p) = &app.popup {
         draw_popup(f, area, p);
     }
-    if let Some(info) = &app.info {
-        draw_info(f, area, info);
+    if let Some((uri, rows)) = &app.info {
+        draw_info(f, area, app, uri, rows);
     }
 }
 
-/// Song-info overlay (ncmpcpp `i`): a bordered box of label/value rows.
-fn draw_info(f: &mut Frame, area: Rect, rows: &[(String, String)]) {
+/// Song-info overlay (ncmpcpp `i`): album art on the left, label/value tags on the right.
+fn draw_info(f: &mut Frame, area: Rect, app: &App, uri: &str, rows: &[(String, String)]) {
     let label_w = rows.iter().map(|(k, _)| k.width()).max().unwrap_or(6);
     let lines: Vec<Line> = rows
         .iter()
@@ -140,13 +141,17 @@ fn draw_info(f: &mut Frame, area: Rect, rows: &[(String, String)]) {
             ])
         })
         .collect();
-    let want_w = rows
+    let text_w = rows
         .iter()
         .map(|(k, v)| k.width() + 2 + v.width())
         .max()
-        .unwrap_or(20) as u16
-        + 4;
-    let w = want_w.clamp(24, area.width.saturating_sub(4));
+        .unwrap_or(20) as u16;
+    // The art is a square sized to the row count; width in cells ~= 2x the rows.
+    let art_rows = rows.len() as u16;
+    let art_w = (art_rows * 2).min(area.width / 3);
+    let has_art = art_w >= 6 && area.width > text_w + art_w + 8;
+    let inner_w = if has_art { art_w + 2 + text_w } else { text_w };
+    let w = (inner_w + 4).clamp(24, area.width.saturating_sub(2));
     let h = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
     let r = Rect {
         x: (area.width - w) / 2,
@@ -162,7 +167,26 @@ fn draw_info(f: &mut Frame, area: Rect, rows: &[(String, String)]) {
         .style(Style::default().fg(MAIN));
     let inner = block.inner(r);
     f.render_widget(block, r);
-    f.render_widget(Paragraph::new(lines), inner);
+    let text_area = if has_art {
+        if let Some(Some(img)) = app.art_cache.get(uri) {
+            render_cover(
+                f,
+                Rect {
+                    width: art_w,
+                    ..inner
+                },
+                img,
+            );
+        }
+        Rect {
+            x: inner.x + art_w + 2,
+            width: inner.width.saturating_sub(art_w + 2),
+            ..inner
+        }
+    } else {
+        inner
+    };
+    f.render_widget(Paragraph::new(lines), text_area);
 }
 
 fn size_menus(app: &mut App, main: Rect) {
@@ -217,7 +241,7 @@ fn volume_state(_app: &App) -> String {
 
 fn screen_title(app: &App, avail: usize) -> String {
     match app.screen {
-        Screen::Cover => "Album art".to_string(),
+        Screen::Stats => "Stats".to_string(),
         Screen::Help => "Help".to_string(),
         Screen::Playlist => {
             let n = app.queue.len();
@@ -751,11 +775,19 @@ fn draw_playlist(f: &mut Frame, area: Rect, app: &App) {
         |i| q.is_sel(i),
         |i| {
             let t = &q.items[i];
-            // now_playing_prefix = $b (bold). Match by tlid, or uri as a fallback.
+            // Match the playing track by tlid, or uri as a fallback.
             let now = Some(t.tlid) == cur
                 || (cur.is_none() && cur_uri.as_deref() == Some(t.track.uri.as_str()));
+            let mut spans = song_columns(&t.track, body.width as usize);
+            if now {
+                // ncmpcpp marks it bold; plain bold is too subtle, so the whole row also
+                // takes the bright accent colour so the playing track is obvious.
+                for s in &mut spans {
+                    s.style = s.style.fg(NOW);
+                }
+            }
             Row {
-                spans: song_columns(&t.track, body.width as usize),
+                spans,
                 right: vec![],
                 sep: false,
                 bold: now,
@@ -822,12 +854,38 @@ fn draw_browser(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
     let se = &app.se;
+    // When the cursor is on a song and there's room, show a preview panel on the right
+    // with that song's album art and full tags.
+    let hovered = match se.cur() {
+        Some(SeItem::Song(t)) => Some(t.clone()),
+        _ => None,
+    };
+    let (list_area, panel) = match &hovered {
+        Some(_) if area.width >= 72 => {
+            let pw = (area.width / 3).clamp(30, 50);
+            let list = Rect {
+                width: area.width - pw - 1,
+                ..area
+            };
+            let panel = Rect {
+                x: area.x + area.width - pw,
+                width: pw,
+                ..area
+            };
+            vsep(f, area.x + area.width - pw - 1, area);
+            (list, Some(panel))
+        }
+        _ => (area, None),
+    };
+    if let (Some(p), Some(t)) = (panel, &hovered) {
+        draw_search_preview(f, p, app, t);
+    }
     // search_engine_display_mode = columns (song results align like the playlist)
-    let cw = area.width as usize;
+    let cw = list_area.width as usize;
     let bold = Style::default().add_modifier(Modifier::BOLD);
     draw_menu(
         f,
-        area,
+        list_area,
         se.len(),
         se.offset,
         se.cursor,
@@ -907,6 +965,74 @@ fn draw_search(f: &mut Frame, area: Rect, app: &App) {
             SeItem::Artist(r) => Row::text(r.name.clone()),
             SeItem::Album(r) => Row::text(format!("[{}]", r.name)),
         },
+    );
+}
+
+/// Right-hand preview for the hovered search song: album art on top, tags below.
+fn draw_search_preview(f: &mut Frame, area: Rect, app: &App, t: &Track) {
+    // Album art fills a square at the top (its height ~ panel width / 2 in cells).
+    let art_h = (area.width / 2).min(area.height.saturating_sub(8));
+    if art_h > 0 {
+        let art_area = Rect {
+            height: art_h,
+            ..area
+        };
+        match art_for(app, &t.uri) {
+            Some(Some(img)) => render_cover(f, art_area, img),
+            Some(None) => f.render_widget(
+                Paragraph::new("\n(no album art)")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                art_area,
+            ),
+            None => f.render_widget(
+                Paragraph::new("\nloading art...")
+                    .alignment(ratatui::layout::Alignment::Center)
+                    .style(Style::default().fg(Color::DarkGray)),
+                art_area,
+            ),
+        }
+    }
+    // Tags below the art.
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let field = |k: &str, v: &str, lines: &mut Vec<Line>| {
+        if !v.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{k}: "), bold.fg(MAIN)),
+                Span::raw(v.to_string()),
+            ]));
+        }
+    };
+    let mut lines = vec![Line::raw("")];
+    field("Title", &t.name, &mut lines);
+    field("Artist", &t.artists, &mut lines);
+    field("Album", &t.album, &mut lines);
+    field("Date", &t.date, &mut lines);
+    field(
+        "Track",
+        &t.track_no.map(|n| n.to_string()).unwrap_or_default(),
+        &mut lines,
+    );
+    field("Length", &t.duration(), &mut lines);
+    let src = if t.uri.starts_with("tidal:") {
+        "Tidal"
+    } else if t.uri.starts_with("local:") || t.uri.starts_with("file:") {
+        "Local"
+    } else {
+        ""
+    };
+    field("Source", src, &mut lines);
+    if app.queue_uris.contains(&t.uri) {
+        lines.push(Line::styled("in queue", Style::default().fg(Color::Green)));
+    }
+    let info_area = Rect {
+        y: area.y + art_h,
+        height: area.height.saturating_sub(art_h),
+        ..area
+    };
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
+        info_area,
     );
 }
 
@@ -1083,47 +1209,66 @@ fn draw_editor(f: &mut Frame, area: Rect, app: &App) {
 
 /// Album art rendered with Unicode upper-half-blocks: two vertical pixels per cell,
 /// foreground = top pixel, background = bottom pixel, so each cell shows two colours.
-fn draw_cover(f: &mut Frame, area: Rect, app: &App) {
-    let msg = |f: &mut Frame, s: &str| {
-        f.render_widget(
-            Paragraph::new(s.to_string()).style(Style::default().fg(MAIN)),
-            area,
-        );
-    };
-    let Some(cur) = &app.current else {
-        return msg(f, "Nothing playing");
-    };
-    let Some((uri, img)) = &app.cover else {
-        if app.cover_failed.as_deref() == Some(cur.track.uri.as_str()) {
-            return msg(f, "No album art for this track");
-        }
-        return msg(f, "Loading album art...");
-    };
-    if *uri != cur.track.uri {
-        return msg(f, "Loading album art...");
+/// Art state for a uri: Some(Some(img)) ready, Some(None) no art, None still loading.
+fn art_for<'a>(app: &'a App, uri: &str) -> Option<&'a Option<image::DynamicImage>> {
+    app.art_cache.get(uri)
+}
+
+/// Render a square album image centred in `area` using truecolor half-blocks.
+/// True when the terminal supports 24-bit colour. The Linux text console does not,
+/// and emitting RGB there both fails and corrupts later colours, so we fall back to
+/// character-based ASCII art. MUSAKONE_ASCII=1 forces ASCII, =0 forces colour.
+fn truecolor() -> bool {
+    match std::env::var("MUSAKONE_ASCII").as_deref() {
+        Ok("1") => return false,
+        Ok("0") => return true,
+        _ => {}
     }
+    let ct = std::env::var("COLORTERM").unwrap_or_default();
+    ct.contains("truecolor") || ct.contains("24bit")
+}
+
+const ASCII_RAMP: &[u8] = b" .,:;irsXA253hMHGS#9B&@";
+
+fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage) {
     use image::GenericImageView;
-    // A character cell is ~twice as tall as wide and shows 2 stacked pixels, so a square
-    // cover needs cols = 2*rows. Fit inside the area: rows <= height and cols <= width.
+    if area.width < 2 || area.height < 1 {
+        return;
+    }
+    let color = truecolor();
+    // A character cell is ~twice as tall as wide. In colour mode one cell stacks two
+    // pixels (so cols = 2*rows); in ASCII mode one cell is one pixel but we still sample
+    // cols = 2*rows to keep the square aspect, mapping brightness to a ramp character.
     let rows = (area.height as u32).min(area.width as u32 / 2).max(1);
     let cols = rows * 2;
-    // Sample cols px wide by 2*rows px tall (a square), then pair rows of pixels per cell.
-    let scaled = img.resize_exact(cols, rows * 2, image::imageops::FilterType::Triangle);
-    let (cols, rows) = (cols as u16, rows as u16);
-    let x0 = area.x + area.width.saturating_sub(cols) / 2;
-    let y0 = area.y + area.height.saturating_sub(rows) / 2;
+    let scaled = img.resize_exact(
+        cols,
+        if color { rows * 2 } else { rows },
+        image::imageops::FilterType::Triangle,
+    );
+    let (cols_u, rows_u) = (cols as u16, rows as u16);
+    let x0 = area.x + area.width.saturating_sub(cols_u) / 2;
+    let y0 = area.y + area.height.saturating_sub(rows_u) / 2;
     let mut lines = Vec::with_capacity(rows as usize);
     for ry in 0..rows {
         let mut spans = Vec::with_capacity(cols as usize);
         for cx in 0..cols {
-            let top = scaled.get_pixel(cx as u32, (ry as u32) * 2).0;
-            let bot = scaled.get_pixel(cx as u32, (ry as u32) * 2 + 1).0;
-            spans.push(Span::styled(
-                "▀",
-                Style::default()
-                    .fg(Color::Rgb(top[0], top[1], top[2]))
-                    .bg(Color::Rgb(bot[0], bot[1], bot[2])),
-            ));
+            if color {
+                let top = scaled.get_pixel(cx, ry * 2).0;
+                let bot = scaled.get_pixel(cx, ry * 2 + 1).0;
+                spans.push(Span::styled(
+                    "▀",
+                    Style::default()
+                        .fg(Color::Rgb(top[0], top[1], top[2]))
+                        .bg(Color::Rgb(bot[0], bot[1], bot[2])),
+                ));
+            } else {
+                let p = scaled.get_pixel(cx, ry).0;
+                // Rec. 601 luma, then index into the dark->light ramp.
+                let luma = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000;
+                let idx = (luma as usize * (ASCII_RAMP.len() - 1)) / 255;
+                spans.push(Span::raw((ASCII_RAMP[idx] as char).to_string()));
+            }
         }
         lines.push(Line::from(spans));
     }
@@ -1132,10 +1277,263 @@ fn draw_cover(f: &mut Frame, area: Rect, app: &App) {
         Rect {
             x: x0,
             y: y0,
-            width: cols,
-            height: rows,
+            width: cols_u,
+            height: rows_u,
         },
     );
+}
+
+/// Stats screen: room or personal listening stats from the Gleam backend.
+fn draw_stats(f: &mut Frame, area: Rect, app: &App) {
+    use serde_json::Value;
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let window = match app.stats_days {
+        7 => "7 days",
+        30 => "30 days",
+        _ => "all time",
+    };
+    let header = Line::from(vec![
+        Span::styled(format!("{} · {window}", app.stats_scope), bold.fg(MAIN)),
+        Span::styled("   (←/→ window · Space room/me · u refresh)", dim),
+    ]);
+    let Some(s) = &app.stats else {
+        f.render_widget(
+            Paragraph::new(vec![
+                header,
+                Line::raw(""),
+                Line::styled("Counting...", dim),
+            ]),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = vec![header, Line::raw("")];
+    let sec = |lines: &mut Vec<Line>, t: &str| {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(t.to_string(), bold.fg(MAIN)));
+    };
+    let kv =
+        |k: &str, v: String| Line::from(vec![Span::styled(format!("{k}: "), bold), Span::raw(v)]);
+    let i = |v: &Value, p: &str| v.pointer(p).and_then(Value::as_i64).unwrap_or(0);
+    let fnum = |v: &Value, p: &str| v.pointer(p).and_then(Value::as_f64).unwrap_or(0.0);
+    let hrs = |h: f64| {
+        if h >= 48.0 {
+            format!("{:.0} d", h / 24.0)
+        } else {
+            format!("{h:.1} h")
+        }
+    };
+
+    if app.stats_scope == "room" {
+        sec(&mut lines, "Room");
+        lines.push(kv("Plays", format!("{}", i(s, "/totals/plays"))));
+        lines.push(kv("Heard", hrs(fnum(s, "/totals/hours"))));
+        lines.push(kv(
+            "Tracks / artists",
+            format!("{} / {}", i(s, "/totals/tracks"), i(s, "/totals/artists")),
+        ));
+        lines.push(kv(
+            "Play days / sessions",
+            format!(
+                "{} / {}",
+                i(s, "/totals/play_days"),
+                i(s, "/totals/sessions")
+            ),
+        ));
+        lines.push(kv("Queue adds", format!("{}", i(s, "/totals/adds"))));
+        lines.push(kv("Searches", format!("{}", i(s, "/totals/searches"))));
+
+        sec(&mut lines, "Top tracks");
+        for t in s
+            .pointer("/top_tracks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(12)
+        {
+            let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+            let artist = t.get("artist").and_then(Value::as_str).unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::raw(format!(
+                    "{:>4}× ",
+                    t.get("plays").and_then(Value::as_i64).unwrap_or(0)
+                )),
+                Span::raw(name.to_string()),
+                Span::styled(format!("  {artist}"), dim),
+            ]));
+        }
+
+        sec(&mut lines, "Top artists");
+        for a in s
+            .pointer("/top_artists")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(10)
+        {
+            lines.push(Line::raw(format!(
+                "{:>4}×  {}",
+                a.get("plays").and_then(Value::as_i64).unwrap_or(0),
+                a.get("artist").and_then(Value::as_str).unwrap_or(""),
+            )));
+        }
+
+        sec(&mut lines, "DJs");
+        for d in s
+            .pointer("/djs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(10)
+        {
+            lines.push(Line::from(vec![
+                Span::raw(format!(
+                    "{:<16}",
+                    d.get("username").and_then(Value::as_str).unwrap_or("")
+                )),
+                Span::styled(
+                    format!(
+                        "{} added · {}% heard 24h · {} played",
+                        d.get("tracks_added").and_then(Value::as_i64).unwrap_or(0),
+                        d.get("heard_24h_pct").and_then(Value::as_i64).unwrap_or(0),
+                        d.get("plays_attributed")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0),
+                    ),
+                    dim,
+                ),
+            ]));
+        }
+
+        sec(&mut lines, "Top searches");
+        for q in s
+            .pointer("/search/top_queries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(6)
+        {
+            lines.push(Line::from(vec![
+                Span::styled("  ", dim),
+                Span::raw(format!(
+                    "{:<24}",
+                    q.get("query").and_then(Value::as_str).unwrap_or("")
+                )),
+                Span::styled(
+                    format!(
+                        "{}× · {}% add",
+                        q.get("searches").and_then(Value::as_i64).unwrap_or(0),
+                        q.get("converted_pct").and_then(Value::as_i64).unwrap_or(0),
+                    ),
+                    dim,
+                ),
+            ]));
+        }
+
+        sec(&mut lines, "Decades");
+        for d in s
+            .pointer("/decades")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            lines.push(Line::raw(format!(
+                "{:<6} {}",
+                d.get("decade").and_then(Value::as_str).unwrap_or(""),
+                d.get("plays").and_then(Value::as_i64).unwrap_or(0),
+            )));
+        }
+    } else {
+        sec(&mut lines, "You");
+        lines.push(kv("Plays you caused", format!("{}", i(s, "/plays/plays"))));
+        lines.push(kv("Heard", hrs(fnum(s, "/plays/hours"))));
+        lines.push(kv(
+            "Tracks queued",
+            format!("{}", i(s, "/queue/tracks_added")),
+        ));
+        lines.push(kv(
+            "Heard within 24h",
+            format!("{}%", i(s, "/queue/heard_24h_pct")),
+        ));
+        lines.push(kv(
+            "Share of room adds",
+            format!("{}%", i(s, "/share_of_room_pct")),
+        ));
+        lines.push(kv(
+            "DJ rank",
+            format!("{} / {}", i(s, "/dj_rank"), i(s, "/dj_count")),
+        ));
+
+        sec(&mut lines, "Your top artists");
+        for a in s
+            .pointer("/top_artists")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(10)
+        {
+            lines.push(Line::raw(format!(
+                "{:>4}×  {}",
+                a.get("plays").and_then(Value::as_i64).unwrap_or(0),
+                a.get("artist").and_then(Value::as_str).unwrap_or(""),
+            )));
+        }
+
+        sec(&mut lines, "Your top tracks");
+        for t in s
+            .pointer("/top_tracks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(10)
+        {
+            lines.push(Line::from(vec![
+                Span::raw(format!(
+                    "{:>4}× ",
+                    t.get("plays").and_then(Value::as_i64).unwrap_or(0)
+                )),
+                Span::raw(
+                    t.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        t.get("artist").and_then(Value::as_str).unwrap_or("")
+                    ),
+                    dim,
+                ),
+            ]));
+        }
+
+        sec(&mut lines, "Kindred (same artists queued)");
+        for k in s
+            .pointer("/kindred")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(6)
+        {
+            lines.push(Line::raw(format!(
+                "{:<16} {} shared artists",
+                k.get("username").and_then(Value::as_str).unwrap_or(""),
+                k.get("shared_artists").and_then(Value::as_i64).unwrap_or(0),
+            )));
+        }
+    }
+
+    let max_off = lines.len().saturating_sub(area.height as usize);
+    let off = app.stats_offset.min(max_off);
+    let shown: Vec<Line> = lines
+        .into_iter()
+        .skip(off)
+        .take(area.height as usize)
+        .collect();
+    f.render_widget(Paragraph::new(shown).style(Style::default().fg(MAIN)), area);
 }
 
 fn draw_lyrics(f: &mut Frame, area: Rect, app: &mut App) {
@@ -1205,7 +1603,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("3", "Show search engine"),
             ("4", "Show media library"),
             ("5", "Show playlist editor"),
-            ("6", "Show album art"),
+            ("6", "Show stats"),
             ("l", "Show/hide song lyrics"),
             ("[ ]", "Jump to previous / next album"),
             ("{ }", "Jump to previous / next artist"),
