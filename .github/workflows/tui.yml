@@ -1,0 +1,56 @@
+name: TUI
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'tui/**'
+      - '.github/workflows/tui.yml'
+  pull_request:
+    paths:
+      - 'tui/**'
+      - '.github/workflows/tui.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tui
+      - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - name: Test
+        working-directory: tui
+        run: cargo test
+      - name: Build (static linux x86_64)
+        working-directory: tui
+        env:
+          MUSAKONE_SHA: ${{ github.sha }}
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/musakone dist/musakone-linux-x86_64
+          cp install.sh dist/
+          dist/musakone-linux-x86_64 --version
+      # Rolling "tui-latest" release: every push to master replaces the binary.
+      # Installed clients pick it up on their next start.
+      - name: Publish
+        if: github.event_name != 'pull_request'
+        working-directory: tui
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete tui-latest --yes --cleanup-tag || true
+          gh release create tui-latest dist/* \
+            --title "musakone tui ${GITHUB_SHA::7}" \
+            --notes "sha: ${GITHUB_SHA}
+
+          Install: curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/tui-latest/install.sh | sh" \
+            --latest=false
