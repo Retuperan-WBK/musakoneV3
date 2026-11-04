@@ -14,7 +14,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const MAIN: Color = Color::Red; // main_window_color = red
 const EMPTY_TAG: Color = Color::Red; // empty_tag_color = red
 const SELECTED: Color = Color::Magenta; // selected_item_prefix $6
-const NOW: Color = Color::Yellow; // now-playing row colour (color2), bold on top
+const NOW: Color = Color::LightYellow; // now-playing row: bright accent, bold on top
 const PROGRESS: Color = Color::DarkGray; // progressbar_color black:b
 const PROGRESS_ELAPSED: Color = Color::Green; // progressbar_elapsed_color
 const STATUSBAR: Color = Color::Yellow; // statusbar_color = yellow
@@ -1230,20 +1230,80 @@ fn truecolor() -> bool {
 
 const ASCII_RAMP: &[u8] = b" .,:;irsXA253hMHGS#9B&@";
 
+/// Standard ANSI 16-colour palette (RGB) for quantising art on the Linux console.
+const ANSI16: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (170, 0, 0),
+    (0, 170, 0),
+    (170, 85, 0),
+    (0, 0, 170),
+    (170, 0, 170),
+    (0, 170, 170),
+    (170, 170, 170),
+    (85, 85, 85),
+    (255, 85, 85),
+    (85, 255, 85),
+    (255, 255, 85),
+    (85, 85, 255),
+    (255, 85, 255),
+    (85, 255, 255),
+    (255, 255, 255),
+];
+// 4x4 Bayer matrix for ordered dithering (spreads quantisation error -> more apparent depth).
+const BAYER4: [[i32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+/// Nearest ANSI-16 colour index, with ordered dithering by pixel position.
+fn quant16(p: [u8; 4], x: u32, y: u32) -> u8 {
+    let d = (BAYER4[(y & 3) as usize][(x & 3) as usize] as f32 / 16.0 - 0.5) * 64.0;
+    let ch = |c: u8| (c as f32 + d).clamp(0.0, 255.0) as i32;
+    let (r, g, b) = (ch(p[0]), ch(p[1]), ch(p[2]));
+    let mut best = 0u8;
+    let mut bestd = i32::MAX;
+    for (i, (pr, pg, pb)) in ANSI16.iter().enumerate() {
+        let dist = (r - *pr as i32).pow(2) + (g - *pg as i32).pow(2) + (b - *pb as i32).pow(2);
+        if dist < bestd {
+            bestd = dist;
+            best = i as u8;
+        }
+    }
+    best
+}
+
+#[derive(PartialEq)]
+enum ArtMode {
+    True,
+    Ansi16,
+    Ascii,
+}
+
+fn art_mode() -> ArtMode {
+    match std::env::var("MUSAKONE_ASCII").as_deref() {
+        Ok("1") | Ok("ascii") => return ArtMode::Ascii,
+        Ok("0") => return ArtMode::True,
+        _ => {}
+    }
+    if truecolor() {
+        ArtMode::True
+    } else {
+        // The Linux text console has 16 colours and the ▀ half-block; that beats mono ASCII.
+        ArtMode::Ansi16
+    }
+}
+
 fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage) {
     use image::GenericImageView;
     if area.width < 2 || area.height < 1 {
         return;
     }
-    let color = truecolor();
-    // A character cell is ~twice as tall as wide. In colour mode one cell stacks two
-    // pixels (so cols = 2*rows); in ASCII mode one cell is one pixel but we still sample
-    // cols = 2*rows to keep the square aspect, mapping brightness to a ramp character.
+    let mode = art_mode();
+    let ascii = mode == ArtMode::Ascii;
+    // A cell is ~twice as tall as wide. Half-block modes stack two pixels per cell
+    // (cols = 2*rows); ASCII uses one pixel per cell but samples the same square.
     let rows = (area.height as u32).min(area.width as u32 / 2).max(1);
     let cols = rows * 2;
     let scaled = img.resize_exact(
         cols,
-        if color { rows * 2 } else { rows },
+        if ascii { rows } else { rows * 2 },
         image::imageops::FilterType::Triangle,
     );
     let (cols_u, rows_u) = (cols as u16, rows as u16);
@@ -1253,21 +1313,33 @@ fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage) {
     for ry in 0..rows {
         let mut spans = Vec::with_capacity(cols as usize);
         for cx in 0..cols {
-            if color {
-                let top = scaled.get_pixel(cx, ry * 2).0;
-                let bot = scaled.get_pixel(cx, ry * 2 + 1).0;
-                spans.push(Span::styled(
-                    "▀",
-                    Style::default()
-                        .fg(Color::Rgb(top[0], top[1], top[2]))
-                        .bg(Color::Rgb(bot[0], bot[1], bot[2])),
-                ));
-            } else {
-                let p = scaled.get_pixel(cx, ry).0;
-                // Rec. 601 luma, then index into the dark->light ramp.
-                let luma = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000;
-                let idx = (luma as usize * (ASCII_RAMP.len() - 1)) / 255;
-                spans.push(Span::raw((ASCII_RAMP[idx] as char).to_string()));
+            match mode {
+                ArtMode::True => {
+                    let top = scaled.get_pixel(cx, ry * 2).0;
+                    let bot = scaled.get_pixel(cx, ry * 2 + 1).0;
+                    spans.push(Span::styled(
+                        "▀",
+                        Style::default()
+                            .fg(Color::Rgb(top[0], top[1], top[2]))
+                            .bg(Color::Rgb(bot[0], bot[1], bot[2])),
+                    ));
+                }
+                ArtMode::Ansi16 => {
+                    let top = quant16(scaled.get_pixel(cx, ry * 2).0, cx, ry * 2);
+                    let bot = quant16(scaled.get_pixel(cx, ry * 2 + 1).0, cx, ry * 2 + 1);
+                    spans.push(Span::styled(
+                        "▀",
+                        Style::default()
+                            .fg(Color::Indexed(top))
+                            .bg(Color::Indexed(bot)),
+                    ));
+                }
+                ArtMode::Ascii => {
+                    let p = scaled.get_pixel(cx, ry).0;
+                    let luma = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000;
+                    let idx = (luma as usize * (ASCII_RAMP.len() - 1)) / 255;
+                    spans.push(Span::raw((ASCII_RAMP[idx] as char).to_string()));
+                }
             }
         }
         lines.push(Line::from(spans));

@@ -42,8 +42,8 @@ green/white/cyan/magenta columns, green progress bar).
 ## Album art and terminals
 
 Song info (`i`) and the search preview show the track's album art. On a truecolor
-terminal it renders in colour (half-blocks); on the Linux text console it falls back to
-luminance ASCII automatically. Force it with `MUSAKONE_ASCII=1` (ASCII) or `=0` (colour).
+terminal it renders in colour (half-blocks); on the Linux text console it uses the 16-colour palette with half-blocks (dithered). `MUSAKONE_ASCII=1` forces plain
+ASCII for mono terminals, `=0` forces truecolor.
 
 ## Stats
 
