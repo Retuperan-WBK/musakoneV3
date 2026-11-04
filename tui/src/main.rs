@@ -130,6 +130,10 @@ async fn main() -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    // Force a full repaint of every cell, including blanks. Without this, on a terminal
+    // that ignores the alternate screen, ratatui's first-frame diff leaves cells it
+    // considers "already blank" untouched, so old scrollback shows through the UI.
+    let _ = terminal.clear();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(1000));
     let mut dirty = true;
@@ -141,7 +145,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             ev = events.next() => match ev {
                 Some(Ok(Event::Key(k))) if k.kind != KeyEventKind::Release => { app.key(k); dirty = true; }
-                Some(Ok(Event::Resize(..))) => dirty = true,
+                Some(Ok(Event::Resize(..))) => { let _ = terminal.clear(); dirty = true; }
                 Some(Err(_)) | None => break,
                 _ => {}
             },

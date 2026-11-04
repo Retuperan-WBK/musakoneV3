@@ -113,12 +113,56 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Library => draw_library(f, main, app),
         Screen::Editor => draw_editor(f, main, app),
         Screen::Lyrics => draw_lyrics(f, main, app),
+        Screen::Cover => draw_cover(f, main, app),
     }
     draw_progress(f, bar, app);
     draw_statusbar(f, status, app);
     if let Some(p) = &app.popup {
         draw_popup(f, area, p);
     }
+    if let Some(info) = &app.info {
+        draw_info(f, area, info);
+    }
+}
+
+/// Song-info overlay (ncmpcpp `i`): a bordered box of label/value rows.
+fn draw_info(f: &mut Frame, area: Rect, rows: &[(String, String)]) {
+    let label_w = rows.iter().map(|(k, _)| k.width()).max().unwrap_or(6);
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, v)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{k:>label_w$}: "),
+                    Style::default().fg(MAIN).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(v.clone()),
+            ])
+        })
+        .collect();
+    let want_w = rows
+        .iter()
+        .map(|(k, v)| k.width() + 2 + v.width())
+        .max()
+        .unwrap_or(20) as u16
+        + 4;
+    let w = want_w.clamp(24, area.width.saturating_sub(4));
+    let h = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let r = Rect {
+        x: (area.width - w) / 2,
+        y: (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, r);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Song info")
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().fg(MAIN));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn size_menus(app: &mut App, main: Rect) {
@@ -173,6 +217,7 @@ fn volume_state(_app: &App) -> String {
 
 fn screen_title(app: &App, avail: usize) -> String {
     match app.screen {
+        Screen::Cover => "Album art".to_string(),
         Screen::Help => "Help".to_string(),
         Screen::Playlist => {
             let n = app.queue.len();
@@ -693,6 +738,7 @@ fn song_columns<'a>(t: &Track, width: usize) -> Vec<Span<'a>> {
 fn draw_playlist(f: &mut Frame, area: Rect, app: &App) {
     let body = titled(f, area, &columns_header(area.width as usize));
     let cur = app.current_tlid();
+    let cur_uri = app.current.as_ref().map(|c| c.track.uri.clone());
     let hl = app.playlist_highlight().then_some(MAIN);
     let q = &app.queue;
     draw_menu(
@@ -705,11 +751,14 @@ fn draw_playlist(f: &mut Frame, area: Rect, app: &App) {
         |i| q.is_sel(i),
         |i| {
             let t = &q.items[i];
+            // now_playing_prefix = $b (bold). Match by tlid, or uri as a fallback.
+            let now = Some(t.tlid) == cur
+                || (cur.is_none() && cur_uri.as_deref() == Some(t.track.uri.as_str()));
             Row {
                 spans: song_columns(&t.track, body.width as usize),
                 right: vec![],
                 sep: false,
-                bold: Some(t.tlid) == cur,
+                bold: now,
             }
         },
     );
@@ -1032,6 +1081,63 @@ fn draw_editor(f: &mut Frame, area: Rect, app: &App) {
 
 // ---------- lyrics ----------
 
+/// Album art rendered with Unicode upper-half-blocks: two vertical pixels per cell,
+/// foreground = top pixel, background = bottom pixel, so each cell shows two colours.
+fn draw_cover(f: &mut Frame, area: Rect, app: &App) {
+    let msg = |f: &mut Frame, s: &str| {
+        f.render_widget(
+            Paragraph::new(s.to_string()).style(Style::default().fg(MAIN)),
+            area,
+        );
+    };
+    let Some(cur) = &app.current else {
+        return msg(f, "Nothing playing");
+    };
+    let Some((uri, img)) = &app.cover else {
+        if app.cover_failed.as_deref() == Some(cur.track.uri.as_str()) {
+            return msg(f, "No album art for this track");
+        }
+        return msg(f, "Loading album art...");
+    };
+    if *uri != cur.track.uri {
+        return msg(f, "Loading album art...");
+    }
+    use image::GenericImageView;
+    // A character cell is ~twice as tall as wide and shows 2 stacked pixels, so a square
+    // cover needs cols = 2*rows. Fit inside the area: rows <= height and cols <= width.
+    let rows = (area.height as u32).min(area.width as u32 / 2).max(1);
+    let cols = rows * 2;
+    // Sample cols px wide by 2*rows px tall (a square), then pair rows of pixels per cell.
+    let scaled = img.resize_exact(cols, rows * 2, image::imageops::FilterType::Triangle);
+    let (cols, rows) = (cols as u16, rows as u16);
+    let x0 = area.x + area.width.saturating_sub(cols) / 2;
+    let y0 = area.y + area.height.saturating_sub(rows) / 2;
+    let mut lines = Vec::with_capacity(rows as usize);
+    for ry in 0..rows {
+        let mut spans = Vec::with_capacity(cols as usize);
+        for cx in 0..cols {
+            let top = scaled.get_pixel(cx as u32, (ry as u32) * 2).0;
+            let bot = scaled.get_pixel(cx as u32, (ry as u32) * 2 + 1).0;
+            spans.push(Span::styled(
+                "▀",
+                Style::default()
+                    .fg(Color::Rgb(top[0], top[1], top[2]))
+                    .bg(Color::Rgb(bot[0], bot[1], bot[2])),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            x: x0,
+            y: y0,
+            width: cols,
+            height: rows,
+        },
+    );
+}
+
 fn draw_lyrics(f: &mut Frame, area: Rect, app: &mut App) {
     let style = Style::default().fg(MAIN);
     let lines: Vec<Line> = match &app.lyrics {
@@ -1099,6 +1205,10 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("3", "Show search engine"),
             ("4", "Show media library"),
             ("5", "Show playlist editor"),
+            ("6", "Show album art"),
+            ("l", "Show/hide song lyrics"),
+            ("[ ]", "Jump to previous / next album"),
+            ("{ }", "Jump to previous / next artist"),
         ],
     ),
     (
@@ -1116,8 +1226,11 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("", ""),
             ("v", "Reverse selection"),
             ("V", "Remove selection"),
+            ("Ctrl-V", "Select range (press at both ends)"),
+            ("B", "Select whole album around the cursor"),
             ("Space", "Select current item"),
             ("a", "Add selected items to playlist"),
+            ("i", "Show song info"),
             ("", ""),
             ("r", "Toggle repeat mode"),
             ("z", "Toggle random mode"),

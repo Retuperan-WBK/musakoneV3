@@ -22,6 +22,7 @@ pub enum Screen {
     Library,
     Editor,
     Lyrics,
+    Cover,
 }
 
 /// NC::Menu: a cursor over items, classic (non-centred) scrolling, per-item selection.
@@ -233,6 +234,8 @@ pub enum Msg {
     Me(i64),
     NeedLogin,
     Lyrics(String, Lyrics),
+    /// Album-art bytes for a track uri (None = no art / fetch failed)
+    Cover(String, Option<Vec<u8>>),
     Info(String),
     Error(String),
     Nothing,
@@ -352,11 +355,19 @@ pub struct App {
     pub lyrics_offset: usize,
     pub lyrics_follow: bool,
     pub help_offset: usize,
+    /// Decoded album art for the current track (uri, image)
+    pub cover: Option<(String, image::DynamicImage)>,
+    cover_loading: Option<String>,
+    pub cover_failed: Option<String>,
 
     pub prompt: Option<Prompt>,
     pub popup: Option<Popup>,
+    /// Song-info overlay (ncmpcpp `i`): label/value pairs, any key closes it
+    pub info: Option<Vec<(String, String)>>,
     pub message: Option<(String, Instant)>,
     find: String,
+    /// First endpoint of a Ctrl-V select-range (set on the first press)
+    range_anchor: Option<usize>,
     pub status_scroll: usize,
     pub title_scroll: usize,
 }
@@ -436,8 +447,13 @@ impl App {
             lyrics_offset: 0,
             lyrics_follow: true,
             help_offset: 0,
+            cover: None,
+            cover_loading: None,
+            cover_failed: None,
             prompt: None,
             popup: None,
+            info: None,
+            range_anchor: None,
             message: None,
             find: String::new(),
             status_scroll: 0,
@@ -1165,6 +1181,46 @@ impl App {
 
     // ---------- lyrics ----------
 
+    /// Fetch and decode the current track's album art (Mopidy get_images → URL → bytes).
+    fn ensure_cover(&mut self) {
+        let Some(uri) = self.current.as_ref().map(|c| c.track.uri.clone()) else {
+            return;
+        };
+        if self.cover.as_ref().map(|(u, _)| u) == Some(&uri)
+            || self.cover_loading.as_ref() == Some(&uri)
+            || self.cover_failed.as_ref() == Some(&uri)
+        {
+            return;
+        }
+        self.cover_loading = Some(uri.clone());
+        let rpc = self.rpc.clone();
+        let api = self.api.clone();
+        self.task(async move {
+            let v = rpc
+                .call("core.library.get_images", json!({ "uris": [uri] }))
+                .await?;
+            // result: { uri: [ { uri, width, height }, ... ] } — take the largest image.
+            let best = v
+                .as_object()
+                .and_then(|m| m.values().next())
+                .and_then(Value::as_array)
+                .and_then(|imgs| {
+                    imgs.iter()
+                        .max_by_key(|i| i.get("width").and_then(Value::as_u64).unwrap_or(0))
+                        .and_then(|i| i.get("uri").and_then(Value::as_str))
+                        .map(String::from)
+                });
+            let key = v
+                .as_object()
+                .and_then(|m| m.keys().next().cloned())
+                .unwrap_or_default();
+            match best {
+                Some(url) => Ok(Msg::Cover(key, Some(api.fetch_bytes(&url).await?))),
+                None => Ok(Msg::Cover(key, None)),
+            }
+        });
+    }
+
     fn ensure_lyrics(&mut self) {
         let Some(cur) = self.current.as_ref().map(|c| c.track.clone()) else {
             return;
@@ -1218,6 +1274,9 @@ impl App {
         }
         if self.screen == Screen::Lyrics {
             self.ensure_lyrics();
+        }
+        if self.screen == Screen::Cover {
+            self.ensure_cover();
         }
     }
 
@@ -1464,6 +1523,18 @@ impl App {
                     self.lyrics_offset = 0;
                 }
             }
+            Msg::Cover(uri, bytes) => {
+                if self.cover_loading.as_ref() == Some(&uri) {
+                    self.cover_loading = None;
+                }
+                match bytes.and_then(|b| image::load_from_memory(&b).ok()) {
+                    Some(img) => {
+                        self.cover = Some((uri, img));
+                        self.cover_failed = None;
+                    }
+                    None => self.cover_failed = Some(uri),
+                }
+            }
         }
     }
 
@@ -1477,16 +1548,30 @@ impl App {
         if self.popup.is_some() {
             return self.popup_key(k);
         }
+        if self.info.is_some() {
+            // Any key dismisses the song-info overlay.
+            self.info = None;
+            return;
+        }
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let columns = matches!(self.screen, Screen::Library | Screen::Editor)
             || (self.screen == Screen::Search && self.se_has_results());
         match k.code {
+            K::Char('v') if ctrl => self.select_range(),
             K::Char('q') => self.quit = true,
+            K::Char('i') => self.show_song_info(),
+            K::Char('B') => self.select_album(),
+            K::Char('[') => self.jump_group(-1, false),
+            K::Char(']') => self.jump_group(1, false),
+            K::Char('{') => self.jump_group(-1, true),
+            K::Char('}') => self.jump_group(1, true),
             K::F(1) => self.goto(Screen::Help),
             K::Char('1') => self.goto(Screen::Playlist),
             K::Char('2') => self.goto(Screen::Browser),
             K::Char('3') => self.goto(Screen::Search),
             K::Char('4') => self.goto(Screen::Library),
             K::Char('5') => self.goto(Screen::Editor),
+            K::Char('6') => self.goto(Screen::Cover),
             K::Char('l') => {
                 if self.screen == Screen::Lyrics {
                     self.goto(self.prev_screen);
@@ -1637,6 +1722,9 @@ impl App {
             self.lyrics_follow = true;
             self.ensure_lyrics();
         }
+        if s == Screen::Cover {
+            self.ensure_cover();
+        }
         if s == Screen::Library
             && self.lib_artists.is_empty()
             && !self.lib_loading
@@ -1743,7 +1831,7 @@ impl App {
                         .collect()
                 }
             }
-            Screen::Lyrics | Screen::Help => vec![],
+            Screen::Lyrics | Screen::Help | Screen::Cover => vec![],
         }
     }
 
@@ -1778,6 +1866,142 @@ impl App {
     }
 
     /// Row text for `/` find on the current screen.
+    /// The Track represented by row `i` on the active screen, if it is a song row.
+    fn row_track(&self, i: usize) -> Option<Track> {
+        match self.screen {
+            Screen::Playlist => self.queue.items.get(i).map(|t| t.track.clone()),
+            Screen::Browser => {
+                let r = self.browser.items.get(i)?;
+                r.is_track()
+                    .then(|| self.track_of(&r.uri).cloned())
+                    .flatten()
+            }
+            Screen::Search => match self.se.items.get(i)? {
+                SeItem::Song(t) => Some(t.clone()),
+                _ => None,
+            },
+            Screen::Library if self.lib_col == 2 => self.lib_songs.items.get(i).cloned(),
+            Screen::Editor if self.ed_col == 1 => self
+                .content
+                .items
+                .get(i)
+                .and_then(|u| self.track_of(u).cloned()),
+            _ => None,
+        }
+    }
+
+    /// Song-info overlay (ncmpcpp `i`): the cursor's song, or the playing one.
+    fn show_song_info(&mut self) {
+        let (_, cur) = self.active_len_cursor();
+        let Some(t) = self
+            .row_track(cur)
+            .or_else(|| self.current.as_ref().map(|c| c.track.clone()))
+        else {
+            self.say("No song here");
+            return;
+        };
+        let mut v = vec![("Title".into(), t.name.clone())];
+        if !t.artists.is_empty() {
+            v.push(("Artist".into(), t.artists.clone()));
+        }
+        if !t.album.is_empty() {
+            v.push(("Album".into(), t.album.clone()));
+        }
+        if !t.date.is_empty() {
+            v.push(("Date".into(), t.date.clone()));
+        }
+        if let Some(n) = t.track_no {
+            v.push(("Track".into(), n.to_string()));
+        }
+        if t.length.is_some() {
+            v.push(("Length".into(), t.duration()));
+        }
+        v.push(("URI".into(), t.uri.clone()));
+        self.info = Some(v);
+    }
+
+    /// ncmpcpp Ctrl-V: first press sets an endpoint, second selects the range.
+    fn select_range(&mut self) {
+        let (_, cur) = self.active_len_cursor();
+        match self.range_anchor.take() {
+            None => {
+                self.range_anchor = Some(cur);
+                self.say("Range selection started; press Ctrl-V again at the other end");
+            }
+            Some(a) => {
+                let (lo, hi) = (a.min(cur), a.max(cur));
+                self.with_menu_sel(|m| {
+                    for s in m.sel.iter_mut().take(hi + 1).skip(lo) {
+                        *s = true;
+                    }
+                });
+                self.say(format!("Selected {} items", hi - lo + 1));
+            }
+        }
+    }
+
+    /// ncmpcpp B: select the run of rows around the cursor that share its album.
+    fn select_album(&mut self) {
+        let (len, cur) = self.active_len_cursor();
+        let Some(t) = self.row_track(cur) else {
+            self.say("Not a song");
+            return;
+        };
+        if t.album.is_empty() {
+            self.say("No album tag");
+            return;
+        }
+        let same = |app: &App, i: usize| app.row_track(i).map(|x| x.album) == Some(t.album.clone());
+        let mut lo = cur;
+        while lo > 0 && same(self, lo - 1) {
+            lo -= 1;
+        }
+        let mut hi = cur;
+        while hi + 1 < len && same(self, hi + 1) {
+            hi += 1;
+        }
+        self.with_menu_sel(|m| {
+            for s in m.sel.iter_mut().take(hi + 1).skip(lo) {
+                *s = true;
+            }
+        });
+        self.say(format!("Selected album ({} tracks)", hi - lo + 1));
+    }
+
+    /// ncmpcpp [ ] { }: move the cursor to the previous/next album or artist boundary.
+    fn jump_group(&mut self, dir: isize, by_artist: bool) {
+        let (len, cur) = self.active_len_cursor();
+        let key = |t: &Track| {
+            if by_artist {
+                t.artists.clone()
+            } else {
+                t.album.clone()
+            }
+        };
+        let Some(cur_t) = self.row_track(cur) else {
+            return;
+        };
+        let cur_key = key(&cur_t);
+        let mut i = cur as isize;
+        loop {
+            i += dir;
+            if i < 0 || i >= len as isize {
+                return;
+            }
+            if self.row_track(i as usize).map(|t| key(&t)) != Some(cur_key.clone()) {
+                break;
+            }
+        }
+        // Going up, land on the first row of the previous group, not its last.
+        if dir < 0 {
+            let gk = self.row_track(i as usize).map(|t| key(&t));
+            while i > 0 && self.row_track((i - 1) as usize).map(|t| key(&t)) == gk {
+                i -= 1;
+            }
+        }
+        self.set_cursor(i as usize);
+    }
+
     fn row_text(&self, i: usize) -> Option<String> {
         Some(match self.screen {
             Screen::Playlist => self.queue.items.get(i)?.track.classic(),
@@ -1910,7 +2134,7 @@ impl App {
                 }
             }
             Screen::Lyrics => self.lyrics_follow = false,
-            Screen::Help => {}
+            Screen::Help | Screen::Cover => {}
         }
     }
 
@@ -2002,7 +2226,7 @@ impl App {
             Screen::Search => self.search_key(k),
             Screen::Library => self.library_key(k),
             Screen::Editor => self.editor_key(k),
-            Screen::Lyrics | Screen::Help => {}
+            Screen::Lyrics | Screen::Help | Screen::Cover => {}
         }
     }
 
@@ -2113,9 +2337,20 @@ impl App {
                     self.rpc_fire("core.playback.play", json!({"tlid": tl.tlid}));
                 }
             }
-            (SeItem::Song(_), K::Char(' '))
-            | (SeItem::Artist(_), K::Char(' '))
-            | (SeItem::Album(_), K::Char(' ')) => {
+            (SeItem::Song(t), K::Char(' ')) => {
+                // Toggle the song in the queue: add if absent, remove every copy if
+                // present (so it can't be queued twice). Update queue_uris optimistically
+                // so the row lights up instantly, then advance to the next song.
+                let uri = t.uri.clone();
+                if self.queue_uris.remove(&uri) {
+                    self.rpc_fire("core.tracklist.remove", json!({"criteria": {"uri": [uri]}}));
+                } else {
+                    self.queue_uris.insert(uri.clone());
+                    self.add_uris(vec![uri], false, None);
+                }
+                self.se.mv_skip(1, SeItem::inactive);
+            }
+            (SeItem::Artist(_), K::Char(' ')) | (SeItem::Album(_), K::Char(' ')) => {
                 let refs = self.chosen_refs();
                 self.se.sel.iter_mut().for_each(|s| *s = false);
                 self.resolve(
