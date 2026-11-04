@@ -163,6 +163,13 @@ impl Api {
     }
 
     /// Lyrics from LRCLIB. Disk-cached per track uri.
+    /// Room or personal listening stats. scope = "room" | "me"; days 7/30/0 (all).
+    pub async fn stats(&self, scope: &str, days: u32) -> Result<Value> {
+        let tz = 120; // Europe/Helsinki-ish; only affects day bucketing
+        self.get(&format!("/api/stats/{scope}?days={days}&tz={tz}"))
+            .await
+    }
+
     /// Raw bytes of a URL (album art). Not a backend call; uses the shared client.
     pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
         let resp = self.http.get(url).send().await?.error_for_status()?;
