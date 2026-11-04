@@ -357,6 +357,8 @@ pub struct App {
     pub lyrics_follow: bool,
     pub help_offset: usize,
     /// Decoded album art for the current track (uri, image)
+    /// Framebuffer blit recorded during a draw, applied by main after the text flushes.
+    pub fb_blit: std::cell::RefCell<Option<crate::fb::Blit>>,
     /// Album art per track uri: Some(img) = decoded, None = fetched but no art.
     pub art_cache: std::collections::HashMap<String, Option<image::DynamicImage>>,
     art_loading: HashSet<String>,
@@ -454,6 +456,7 @@ impl App {
             lyrics_offset: 0,
             lyrics_follow: true,
             help_offset: 0,
+            fb_blit: std::cell::RefCell::new(None),
             art_cache: std::collections::HashMap::new(),
             art_loading: HashSet::new(),
             stats: None,
