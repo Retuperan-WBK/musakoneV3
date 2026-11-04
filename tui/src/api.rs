@@ -163,6 +163,12 @@ impl Api {
     }
 
     /// Lyrics from LRCLIB. Disk-cached per track uri.
+    /// Raw bytes of a URL (album art). Not a backend call; uses the shared client.
+    pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self.http.get(url).send().await?.error_for_status()?;
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     pub async fn lyrics(&self, track: &Track, cache_dir: &std::path::Path) -> Result<Lyrics> {
         let path = cache_dir.join(format!("{}.json", lyrics_key(&track.uri)));
         if let Ok(s) = std::fs::read_to_string(&path) {
