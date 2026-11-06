@@ -1,0 +1,25 @@
+# Local-library playback without a sound device (including Docker Desktop on macOS).
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    mopidy \
+    python3-venv \
+    gstreamer1.0-libav \
+    curl \
+    && python3 -m venv --system-site-packages /opt/mopidy \
+    && /opt/mopidy/bin/pip install --no-cache-dir Mopidy-Local==3.2.1 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/opt/mopidy/bin:$PATH"
+
+RUN mkdir -p /var/lib/mopidy /var/cache/mopidy /config \
+    && chown -R mopidy:audio /var/lib/mopidy /var/cache/mopidy /config
+
+COPY --chown=mopidy:audio mopidy.dev.conf /config/mopidy.conf
+
+USER mopidy
+WORKDIR /var/lib/mopidy
+EXPOSE 6680
+
+# Scan on every start so new debugging tracks appear after a restart too.
+CMD ["sh", "-c", "python -m mopidy --config /config/mopidy.conf local scan && exec python -m mopidy --config /config/mopidy.conf"]

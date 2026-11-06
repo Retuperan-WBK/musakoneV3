@@ -68,6 +68,44 @@ docker-compose exec mopidy mopidy local scan
 
 ## Development
 
+### Local Docker stack + native TUI (macOS/Linux)
+
+Put debugging MP3s in the gitignored `music/` folder, then run from the repository root:
+
+```bash
+./dev.sh up       # Build/start Mopidy, backend and web UI; scan music/; create dev user
+./dev.sh tui      # Compile/run the TUI in your terminal (requires Rust/Cargo)
+```
+
+The web UI is at **http://127.0.0.1:3000**, the backend at **http://127.0.0.1:3001**.
+Login is **dev / dev**. TUI login is automatic. Try `2` for now playing, `3` for
+search, `4` for the file/library browser, `5` for the indexed local media library,
+and `8` (or `F1`) for key bindings.
+
+To preview real-font Linux framebuffer lyrics on the Mac without Docker or
+playback, run `./dev.sh preview --open`. It generates Now Playing and Live Lyrics
+images under `.dev/preview/`; see `tui/README.md` for size, text and cover options.
+
+This uses `docker-compose.dev.yml`, not the deployment `.env`. All published ports
+bind to loopback, music is mounted read-only, and Docker data is stored in separate
+`musakone-dev` volumes. The TUI keeps its token/URL/cache in the gitignored `.dev/`
+directory, leaving your normal orchestra-server configuration untouched.
+
+Playback is intentionally **silent**: Mopidy decodes the MP3s into a real-time dummy
+audio sink, so play/pause, seeking, queue changes and listening stats work without a
+sound device. This also works on Docker Desktop for macOS.
+
+```bash
+./dev.sh scan           # Rescan after adding/changing music
+./dev.sh logs -f        # Follow logs (or add a service, e.g. backend)
+./dev.sh up             # Rebuild/restart after backend or web UI changes
+./dev.sh down           # Stop; keep library index, users, playlists and stats
+```
+
+TUI changes only need restarting `./dev.sh tui`; Cargo rebuilds changed code.
+`./dev.sh down -v` also deletes the **development** database and library index.
+It does not delete your MP3s.
+
 ### Frontend Development
 
 For local development with hot reload:
