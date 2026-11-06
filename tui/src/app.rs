@@ -1,5 +1,6 @@
-//! Application state and ncmpcpp key handling. Screens: F1 help, 1 playlist, 2 browser,
-//! 3 search engine, 4 media library, 5 playlist editor, l lyrics.
+//! Application state and ncmpcpp key handling. Screens: 1 playlist, 2 now playing,
+//! 3 search engine, 4 browser, 5 media library, 6 playlist editor, 7 stats, 8/F1 help,
+//! l lyrics.
 use crate::api::{lyrics_key, Api, Lyrics};
 use crate::model::*;
 use crate::rpc::Rpc;
@@ -17,6 +18,7 @@ use tokio::sync::mpsc;
 pub enum Screen {
     Help,
     Playlist,
+    NowPlaying,
     Browser,
     Search,
     Library,
@@ -220,8 +222,8 @@ pub enum Msg {
     Volume(i64),
     Queue(Vec<TlTrack>),
     Options(bool, bool, bool, bool),
-    Browsed(String, Vec<Ref>),
-    Tracks(Vec<Track>),
+    Browsed(String, u64, Result<Vec<Ref>, String>),
+    Metadata(Vec<String>, u64, Result<Vec<Track>, String>),
     Searched(Vec<Track>, Vec<Ref>, Vec<Ref>),
     Artists(Vec<Ref>),
     Albums(String, Vec<Ref>),
@@ -233,9 +235,9 @@ pub enum Msg {
     LoggedIn(String),
     Me(i64),
     NeedLogin,
-    Lyrics(String, Lyrics),
-    /// Album-art bytes for a track uri (None = no art / fetch failed)
-    Cover(String, Option<Vec<u8>>),
+    Lyrics(String, Result<Lyrics, String>),
+    /// Always completes the loading state, including RPC and HTTP failures.
+    Cover(String, Result<Option<Vec<u8>>, String>),
     Stats(Value),
     Info(String),
     Error(String),
@@ -284,6 +286,7 @@ pub enum LyricsState {
     Idle,
     Fetching(String),
     Loaded(String, Vec<(Option<u64>, String)>),
+    Failed(String),
 }
 
 pub struct App {
@@ -321,10 +324,15 @@ pub struct App {
     pub queue_uris: HashSet<String>,
     pub queue_len_ms: u64,
     pub tracks: HashMap<String, Track>,
+    metadata_pending: HashSet<String>,
+    metadata_batches: usize,
+    metadata_unavailable: HashSet<String>,
 
     pub browse_stack: Vec<(Option<String>, String, usize)>,
     pub browser: Menu<Ref>,
-    browse_cache: HashMap<String, Vec<Ref>>,
+    browse_cache: crate::cache::Cache<String, Vec<Ref>>,
+    browse_pending: HashSet<String>,
+    library_generation: u64,
     pub browse_loading: bool,
 
     pub se: Menu<SeItem>,
@@ -353,14 +361,14 @@ pub struct App {
     pl_cache: HashMap<i64, Vec<String>>,
 
     pub lyrics: LyricsState,
-    pub lyrics_offset: usize,
-    pub lyrics_follow: bool,
     pub help_offset: usize,
-    /// Decoded album art for the current track (uri, image)
-    /// Framebuffer blit recorded during a draw, applied by main after the text flushes.
-    pub fb_blit: std::cell::RefCell<Option<crate::fb::Blit>>,
+    /// Physical framebuffer size, or an emulated surface for the offline preview.
+    pub pixel_size: Option<(u32, u32)>,
+    /// Cover and lyric overlays, applied in order after the terminal text flushes.
+    pub fb_blits: std::cell::RefCell<Vec<crate::fb::Blit>>,
+    pub render_cache: std::cell::RefCell<crate::ui::RenderCache>,
     /// Album art per track uri: Some(img) = decoded, None = fetched but no art.
-    pub art_cache: std::collections::HashMap<String, Option<image::DynamicImage>>,
+    pub art_cache: HashMap<String, Option<image::DynamicImage>>,
     art_loading: HashSet<String>,
     /// Stats screen: fetched payload, scope "room"/"me", window days (7/30/0), scroll.
     pub stats: Option<Value>,
@@ -427,9 +435,14 @@ impl App {
             queue_uris: HashSet::new(),
             queue_len_ms: 0,
             tracks: HashMap::new(),
+            metadata_pending: HashSet::new(),
+            metadata_batches: 0,
+            metadata_unavailable: HashSet::new(),
             browse_stack: vec![(None, String::new(), 0)],
             browser: Menu::default(),
-            browse_cache: HashMap::new(),
+            browse_cache: crate::cache::Cache::new(64, 16 * 1024 * 1024),
+            browse_pending: HashSet::new(),
+            library_generation: 0,
             browse_loading: false,
             se,
             se_fields: Default::default(),
@@ -453,11 +466,11 @@ impl App {
             ed_col: 0,
             pl_cache: HashMap::new(),
             lyrics: LyricsState::Idle,
-            lyrics_offset: 0,
-            lyrics_follow: true,
             help_offset: 0,
-            fb_blit: std::cell::RefCell::new(None),
-            art_cache: std::collections::HashMap::new(),
+            pixel_size: None,
+            fb_blits: std::cell::RefCell::new(vec![]),
+            render_cache: Default::default(),
+            art_cache: HashMap::new(),
             art_loading: HashSet::new(),
             stats: None,
             stats_loading: false,
@@ -533,11 +546,17 @@ impl App {
         }
     }
 
-    /// Batch-lookup metadata for uris not in the cache (one RPC per 100 uris).
-    fn lookup_missing(&self, uris: &[String]) {
+    /// At most two metadata batches in flight; never queue an entire directory
+    /// ahead of the user's next browse/play command on a serial provider.
+    fn lookup_missing(&mut self, uris: &[String]) {
+        if !self.connected || self.metadata_batches >= 2 {
+            return;
+        }
         let missing: Vec<String> = uris
             .iter()
-            .filter(|u| !self.tracks.contains_key(*u))
+            .filter(|u| !self.tracks.contains_key(*u) && !self.metadata_unavailable.contains(*u))
+            .filter(|u| !self.metadata_pending.contains(*u))
+            .take((2 - self.metadata_batches) * 100)
             .cloned()
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -545,17 +564,62 @@ impl App {
         for chunk in missing.chunks(100) {
             let rpc = self.rpc.clone();
             let chunk = chunk.to_vec();
+            self.metadata_pending.extend(chunk.iter().cloned());
+            self.metadata_batches += 1;
+            let generation = self.library_generation;
             self.task(async move {
-                let v = rpc
+                let result = rpc
                     .call("core.library.lookup", json!({"uris": chunk}))
-                    .await?;
-                Ok(Msg::Tracks(flatten_lookup(&v)))
+                    .await
+                    .map(|v| flatten_lookup(&v))
+                    .map_err(|e| e.to_string());
+                Ok(Msg::Metadata(chunk, generation, result))
             });
         }
     }
 
+    /// Names arrive with browse; tags are only needed for the viewport and one
+    /// screen ahead. Called after layout so resize and fast scrolling use the
+    /// newest viewport rather than enqueueing obsolete pages on every keypress.
+    pub fn ensure_visible_metadata(&mut self) {
+        let uris = match self.screen {
+            Screen::Browser => self
+                .browser
+                .items
+                .iter()
+                .skip(self.browser.offset)
+                .take(self.browser.height.saturating_mul(2).min(100))
+                .filter(|r| r.is_track())
+                .map(|r| r.uri.clone())
+                .collect::<Vec<_>>(),
+            Screen::Editor => self
+                .content
+                .items
+                .iter()
+                .skip(self.content.offset)
+                .take(self.content.height.saturating_mul(2).min(100))
+                .cloned()
+                .collect(),
+            _ => return,
+        };
+        self.lookup_missing(&uris);
+    }
+
+    fn invalidate_library(&mut self) {
+        self.library_generation += 1;
+        self.browse_cache.clear();
+        self.browse_pending.clear();
+        self.metadata_pending.clear();
+        self.metadata_batches = 0;
+        self.metadata_unavailable.clear();
+        self.tracks.clear();
+        if self.screen == Screen::Browser {
+            self.browse_load();
+        }
+    }
+
     /// Toggle a playback mode and announce the new state, like ncmpcpp's statusbar.
-    fn toggle_mode(&mut self, method: &'static str, _name: &str, current: bool) {
+    fn toggle_mode(&mut self, method: &'static str, current: bool) {
         self.rpc_fire(method, json!({ "value": !current }));
     }
 
@@ -731,37 +795,52 @@ impl App {
     fn browse_load(&mut self) {
         let uri = self.browse_uri();
         let key = uri.clone().unwrap_or_default();
-        if let Some(items) = self.browse_cache.get(&key).cloned() {
-            let mut items = items;
-            if self.browse_stack.len() > 1 {
-                items.insert(
-                    0,
-                    Ref {
-                        kind: "parent".into(),
-                        uri: String::new(),
-                        name: "..".into(),
-                    },
-                );
-            }
-            let uris: Vec<String> = items
-                .iter()
-                .filter(|r| r.is_track())
-                .map(|r| r.uri.clone())
-                .collect();
-            let cursor = self.browser.cursor;
-            self.browser.set(items);
-            self.browser.cursor = cursor;
-            self.browser.clamp();
-            self.lookup_missing(&uris);
+        if let Some(items) = self.browse_cache.get(&key) {
+            self.browse_show(items);
             return;
         }
         self.browse_loading = true;
+        if !self.browse_pending.insert(key.clone()) {
+            return;
+        }
         let rpc = self.rpc.clone();
+        let generation = self.library_generation;
         self.task(async move {
-            let v = rpc.call("core.library.browse", json!({"uri": uri})).await?;
-            let refs: Vec<Ref> = serde_json::from_value(v)?;
-            Ok(Msg::Browsed(key, refs))
+            let result = async {
+                let v = rpc.call("core.library.browse", json!({"uri": uri})).await?;
+                Ok::<Vec<Ref>, anyhow::Error>(serde_json::from_value(v)?)
+            }
+            .await
+            .map_err(|e| e.to_string());
+            Ok(Msg::Browsed(key, generation, result))
         });
+    }
+
+    fn browse_show(&mut self, mut items: Vec<Ref>) {
+        if self.browse_stack.len() > 1 {
+            items.insert(
+                0,
+                Ref {
+                    kind: "parent".into(),
+                    uri: String::new(),
+                    name: "..".into(),
+                },
+            );
+        }
+        let cursor = self.browser.cursor;
+        self.browser.set(items);
+        self.browser.cursor = cursor;
+        self.browser.clamp();
+        self.browse_loading = false;
+    }
+
+    fn cache_browse(&mut self, uri: String, refs: Vec<Ref>) {
+        let bytes = uri.len()
+            + refs
+                .iter()
+                .map(|r| std::mem::size_of::<Ref>() + r.uri.len() + r.kind.len() + r.name.len())
+                .sum::<usize>();
+        self.browse_cache.insert(uri, refs, bytes);
     }
 
     fn browse_into(&mut self, uri: String, name: String) {
@@ -818,6 +897,7 @@ impl App {
         self.se_artists.clear();
         self.se_albums.clear();
         self.se.set(Self::se_static());
+        self.se.home();
     }
 
     /// Static form + results block for the active tab.
@@ -1126,7 +1206,6 @@ impl App {
             return;
         };
         if let Some(t) = self.pl_cache.get(&p.id).cloned() {
-            self.lookup_missing(&t);
             let cursor = self.content.cursor;
             self.content.set(t);
             self.content.cursor = cursor;
@@ -1193,7 +1272,22 @@ impl App {
         });
     }
 
-    // ---------- lyrics ----------
+    // ---------- artwork / lyrics ----------
+
+    /// Only load current-track media while one of its display screens is visible.
+    fn ensure_current_media(&mut self) {
+        if !matches!(self.screen, Screen::NowPlaying | Screen::Lyrics) {
+            return;
+        }
+        let Some(uri) = self.current.as_ref().map(|c| c.track.uri.clone()) else {
+            self.lyrics = LyricsState::Idle;
+            return;
+        };
+        self.ensure_lyrics();
+        if self.screen == Screen::NowPlaying {
+            self.ensure_art(uri);
+        }
+    }
 
     /// Prefetch art for the song under the search cursor (for the preview panel).
     fn ensure_search_art(&mut self) {
@@ -1256,25 +1350,16 @@ impl App {
         self.art_loading.insert(uri.clone());
         let rpc = self.rpc.clone();
         let api = self.api.clone();
+        let roots = self.browse_cache.get("");
         self.task(async move {
-            let v = rpc
-                .call("core.library.get_images", json!({ "uris": [uri.clone()] }))
-                .await?;
-            // result: { uri: [ { uri, width, height }, ... ] } — take the largest image.
-            let best = v
-                .as_object()
-                .and_then(|m| m.values().next())
-                .and_then(Value::as_array)
-                .and_then(|imgs| {
-                    imgs.iter()
-                        .max_by_key(|i| i.get("width").and_then(Value::as_u64).unwrap_or(0))
-                        .and_then(|i| i.get("uri").and_then(Value::as_str))
-                        .map(String::from)
-                });
-            match best {
-                Some(url) => Ok(Msg::Cover(uri, Some(api.fetch_bytes(&url).await?))),
-                None => Ok(Msg::Cover(uri, None)),
+            let result: Result<Option<Vec<u8>>> = async {
+                match cover_image_url(&rpc, &uri, roots).await? {
+                    Some(url) => Ok(Some(api.fetch_bytes(&url).await?)),
+                    None => Ok(None),
+                }
             }
+            .await;
+            Ok(Msg::Cover(uri, result.map_err(|e| e.to_string())))
         });
     }
 
@@ -1283,26 +1368,31 @@ impl App {
             return;
         };
         match &self.lyrics {
-            LyricsState::Loaded(u, _) | LyricsState::Fetching(u) if *u == cur.uri => return,
+            LyricsState::Loaded(u, _) | LyricsState::Fetching(u) | LyricsState::Failed(u)
+                if *u == cur.uri =>
+            {
+                return;
+            }
             _ => {}
         }
         self.lyrics = LyricsState::Fetching(cur.uri.clone());
-        self.lyrics_offset = 0;
-        self.lyrics_follow = true;
         let api = self.api.clone();
         let dir = self.lyrics_dir.clone();
         self.task(async move {
             let uri = cur.uri.clone();
-            let l = api.lyrics(&cur, &dir).await?;
+            let l = api.lyrics(&cur, &dir).await.map_err(|e| e.to_string());
             Ok(Msg::Lyrics(uri, l))
         });
     }
 
     /// Index of the lyric line active at the current position (synced lyrics only).
     pub fn lyrics_active(&self) -> Option<usize> {
-        let LyricsState::Loaded(_, lines) = &self.lyrics else {
+        let LyricsState::Loaded(uri, lines) = &self.lyrics else {
             return None;
         };
+        if self.current.as_ref()?.track.uri != *uri {
+            return None;
+        }
         let now = self.elapsed_ms();
         let mut active = None;
         for (i, (ts, _)) in lines.iter().enumerate() {
@@ -1313,6 +1403,13 @@ impl App {
             }
         }
         active
+    }
+
+    pub fn current_lyric(&self) -> Option<&str> {
+        let LyricsState::Loaded(_, lines) = &self.lyrics else {
+            return None;
+        };
+        Some(lines.get(self.lyrics_active()?)?.1.as_str())
     }
 
     // ---------- messages from tasks / mopidy ----------
@@ -1329,9 +1426,7 @@ impl App {
                 self.message = None;
             }
         }
-        if self.screen == Screen::Lyrics {
-            self.ensure_lyrics();
-        }
+        self.ensure_current_media();
         if self.screen == Screen::Stats {
             self.ensure_stats();
         }
@@ -1342,6 +1437,7 @@ impl App {
 
     pub fn on_connected(&mut self) {
         self.connected = true;
+        self.invalidate_library();
         self.refresh_all();
     }
 
@@ -1403,8 +1499,10 @@ impl App {
             }
             "seeked" => self.set_pos(tp.unwrap_or(0)),
             "options_changed" => self.load_options(),
+            "library_changed" => self.invalidate_library(),
             "mopidy_connected" => {
                 self.mopidy_ok = true;
+                self.invalidate_library();
                 self.refresh_all();
             }
             "mopidy_disconnected" => {
@@ -1413,6 +1511,7 @@ impl App {
             }
             _ => {}
         }
+        self.ensure_current_media();
     }
 
     pub fn on_msg(&mut self, m: Msg) {
@@ -1442,6 +1541,7 @@ impl App {
                     self.tracks.insert(t.track.uri.clone(), t.track.clone());
                 }
                 self.current = c;
+                self.ensure_current_media();
             }
             Msg::Position(p) => self.set_pos(p),
             Msg::Volume(v) => self.volume = v,
@@ -1490,15 +1590,41 @@ impl App {
                 self.single = y;
                 self.consume = c;
             }
-            Msg::Browsed(uri, refs) => {
-                self.browse_loading = false;
-                self.browse_cache.insert(uri.clone(), refs);
-                if self.browse_uri().unwrap_or_default() == uri {
-                    self.browse_load();
+            Msg::Browsed(uri, generation, result) => {
+                if generation != self.library_generation {
+                    return;
+                }
+                self.browse_pending.remove(&uri);
+                let current = self.browse_uri().unwrap_or_default() == uri;
+                match result {
+                    Ok(refs) => {
+                        if current {
+                            self.browse_show(refs.clone());
+                        }
+                        self.cache_browse(uri, refs);
+                    }
+                    Err(error) if current => {
+                        self.browse_loading = false;
+                        self.say(format!("Could not browse: {error}"));
+                    }
+                    Err(_) => {}
                 }
             }
-            Msg::Tracks(ts) => {
-                self.remember(ts);
+            Msg::Metadata(uris, generation, result) => {
+                if generation != self.library_generation {
+                    return;
+                }
+                self.metadata_batches = self.metadata_batches.saturating_sub(1);
+                for uri in &uris {
+                    self.metadata_pending.remove(uri);
+                }
+                if let Ok(tracks) = result {
+                    self.remember(tracks);
+                }
+                // Missing or failed metadata keeps its browse name and is retried
+                // after a library refresh/reconnect, not on every frame.
+                self.metadata_unavailable
+                    .extend(uris.into_iter().filter(|u| !self.tracks.contains_key(u)));
                 if self.screen == Screen::Library {
                     self.lib_sync_songs();
                 }
@@ -1577,15 +1703,27 @@ impl App {
                 self.rpc.set_token(Some(token));
                 self.check_login();
             }
-            Msg::Lyrics(uri, l) => {
+            Msg::Lyrics(uri, result) => {
                 if matches!(&self.lyrics, LyricsState::Fetching(u) if *u == uri) {
-                    self.lyrics = LyricsState::Loaded(uri, l.lines());
-                    self.lyrics_offset = 0;
+                    self.lyrics = match result {
+                        Ok(l) => LyricsState::Loaded(uri, l.lines()),
+                        Err(error) => {
+                            self.say(format!("Could not load lyrics: {error}"));
+                            LyricsState::Failed(uri)
+                        }
+                    };
                 }
             }
-            Msg::Cover(uri, bytes) => {
+            Msg::Cover(uri, result) => {
+                self.render_cache.borrow_mut().clear_covers();
                 self.art_loading.remove(&uri);
-                let img = bytes.and_then(|b| image::load_from_memory(&b).ok());
+                let img = match result {
+                    Ok(bytes) => bytes.and_then(|b| image::load_from_memory(&b).ok()),
+                    Err(error) => {
+                        self.say(format!("Could not load album art: {error}"));
+                        None
+                    }
+                };
                 self.art_cache.insert(uri, img);
             }
             Msg::Stats(v) => {
@@ -1622,13 +1760,19 @@ impl App {
             K::Char(']') => self.jump_group(1, false),
             K::Char('{') => self.jump_group(-1, true),
             K::Char('}') => self.jump_group(1, true),
-            K::F(1) => self.goto(Screen::Help),
+            K::Char('8') | K::F(1) => self.goto(Screen::Help),
             K::Char('1') => self.goto(Screen::Playlist),
-            K::Char('2') => self.goto(Screen::Browser),
-            K::Char('3') => self.goto(Screen::Search),
-            K::Char('4') => self.goto(Screen::Library),
-            K::Char('5') => self.goto(Screen::Editor),
-            K::Char('6') => self.goto(Screen::Stats),
+            K::Char('2') => self.goto(Screen::NowPlaying),
+            K::Char('3') => {
+                if self.screen == Screen::Search {
+                    self.se_reset();
+                }
+                self.goto(Screen::Search);
+            }
+            K::Char('4') => self.goto(Screen::Browser),
+            K::Char('5') => self.goto(Screen::Library),
+            K::Char('6') => self.goto(Screen::Editor),
+            K::Char('7') => self.goto(Screen::Stats),
             K::Char('l') => {
                 if self.screen == Screen::Lyrics {
                     self.goto(self.prev_screen);
@@ -1654,16 +1798,17 @@ impl App {
             K::Char('<') => self.rpc_fire("core.playback.previous", json!({})),
             K::Char('f') => self.seek(1),
             K::Char('b') => self.seek(-1),
+            K::Left | K::Right if self.screen == Screen::Browser => self.browser_key(k),
             K::Left if self.screen == Screen::Stats => self.cycle_stats_range(-1),
             K::Right if self.screen == Screen::Stats => self.cycle_stats_range(1),
             K::Right if columns => self.next_column(1),
             K::Left if columns => self.next_column(-1),
             K::Right | K::Char('+') => self.set_volume(self.volume + VOL_STEP),
             K::Left | K::Char('-') => self.set_volume(self.volume - VOL_STEP),
-            K::Char('r') => self.toggle_mode("core.tracklist.set_repeat", "Repeat", self.repeat),
-            K::Char('z') => self.toggle_mode("core.tracklist.set_random", "Random", self.random),
-            K::Char('y') => self.toggle_mode("core.tracklist.set_single", "Single", self.single),
-            K::Char('R') => self.toggle_mode("core.tracklist.set_consume", "Consume", self.consume),
+            K::Char('r') => self.toggle_mode("core.tracklist.set_repeat", self.repeat),
+            K::Char('z') => self.toggle_mode("core.tracklist.set_random", self.random),
+            K::Char('y') => self.toggle_mode("core.tracklist.set_single", self.single),
+            K::Char('R') => self.toggle_mode("core.tracklist.set_consume", self.consume),
             K::Char('Z') => {
                 self.rpc_fire("core.tracklist.shuffle", json!({}));
                 self.say("Playlist shuffled");
@@ -1696,7 +1841,7 @@ impl App {
             K::Char('u') if self.screen == Screen::Stats => self.reload_stats(),
             K::Char('u') => {
                 self.rpc_fire("core.library.refresh", json!({}));
-                self.browse_cache.clear();
+                self.invalidate_library();
                 self.say("Database update started");
             }
             K::Char('/') => self.ask(PromptKind::Find(1), "Find: "),
@@ -1713,9 +1858,7 @@ impl App {
                         self.queue.cursor = i;
                         self.queue.fix_offset();
                     }
-                    if self.screen == Screen::Lyrics {
-                        self.lyrics_follow = true;
-                    } else {
+                    if self.screen != Screen::Lyrics {
                         self.goto(Screen::Playlist);
                     }
                 }
@@ -1758,7 +1901,7 @@ impl App {
                     kind: PromptKind::Username,
                 });
             }
-            K::Char('`') if self.screen == Screen::Lyrics => {
+            K::Char('`') if matches!(self.screen, Screen::NowPlaying | Screen::Lyrics) => {
                 if let Some(c) = &self.current {
                     let _ = std::fs::remove_file(
                         self.lyrics_dir
@@ -1778,10 +1921,7 @@ impl App {
             self.screen = s;
             self.title_scroll = 0;
         }
-        if s == Screen::Lyrics {
-            self.lyrics_follow = true;
-            self.ensure_lyrics();
-        }
+        self.ensure_current_media();
         if s == Screen::Stats {
             self.ensure_stats();
         }
@@ -1856,6 +1996,7 @@ impl App {
     /// Items under the cursor/selection on the current screen, as refs to resolve.
     fn chosen_refs(&self) -> Vec<Ref> {
         match self.screen {
+            Screen::NowPlaying => self.current.iter().map(|c| track_ref(&c.track)).collect(),
             Screen::Playlist => self
                 .queue
                 .chosen()
@@ -2197,26 +2338,14 @@ impl App {
                     self.content.fix_offset();
                 }
             }
-            Screen::Lyrics => self.lyrics_follow = false,
-            Screen::Help | Screen::Stats => {}
+            Screen::NowPlaying | Screen::Lyrics | Screen::Help | Screen::Stats => {}
         }
     }
 
     /// Movement keys shared by every list screen.
     fn mv(&mut self, d: isize, page: bool) {
         match self.screen {
-            Screen::Lyrics => {
-                let n = match &self.lyrics {
-                    LyricsState::Loaded(_, l) => l.len(),
-                    _ => 0,
-                };
-                let step = if page { 10 } else { 1 };
-                self.lyrics_offset = (self.lyrics_offset as isize + d * step)
-                    .clamp(0, n.saturating_sub(1) as isize)
-                    as usize;
-                self.lyrics_follow = false;
-                return;
-            }
+            Screen::Lyrics => return,
             Screen::Help => {
                 let step = if page { 10 } else { 1 };
                 self.help_offset = (self.help_offset as isize + d * step)
@@ -2302,7 +2431,7 @@ impl App {
                     _ => {}
                 }
             }
-            Screen::Lyrics | Screen::Help => {}
+            Screen::NowPlaying | Screen::Lyrics | Screen::Help => {}
         }
     }
 
@@ -2356,13 +2485,16 @@ impl App {
     }
 
     fn browser_key(&mut self, k: KeyEvent) {
-        if matches!(k.code, K::Backspace) {
+        if matches!(k.code, K::Left | K::Backspace) {
             return self.browse_up();
         }
         let Some(r) = self.browser.cur().cloned() else {
             return;
         };
         match k.code {
+            K::Right if !r.is_track() && r.kind != "parent" => {
+                self.browse_into(r.uri, r.name);
+            }
             K::Enter => {
                 if r.kind == "parent" {
                     self.browse_up();
@@ -2810,6 +2942,90 @@ fn uri_ref(u: &str) -> Ref {
     }
 }
 
+/// Files and Local media use different URIs for the same recording. Resolve a
+/// Files path relative to a configured music root, never a hardcoded mount path.
+fn local_art_uri(uri: &str, root: &str) -> Option<String> {
+    let file = reqwest::Url::parse(uri).ok()?;
+    let base = reqwest::Url::parse(root).ok()?;
+    if file.scheme() != "file"
+        || base.scheme() != "file"
+        || file.host_str() != base.host_str()
+        || file.query().is_some()
+        || file.fragment().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return None;
+    }
+    let relative = file
+        .path()
+        .strip_prefix(base.path().trim_end_matches('/'))?
+        .strip_prefix('/')?;
+    if relative.is_empty() {
+        return None;
+    }
+    Some(format!("local:track:{relative}"))
+}
+
+fn largest_image(v: &Value, uri: &str) -> Option<String> {
+    v.get(uri)?
+        .as_array()?
+        .iter()
+        .filter(|img| img.get("uri").and_then(Value::as_str).is_some())
+        .max_by_key(|img| img.get("width").and_then(Value::as_u64).unwrap_or(0))?
+        .get("uri")?
+        .as_str()
+        .map(String::from)
+}
+
+async fn cover_image_url(
+    rpc: &Rpc,
+    uri: &str,
+    cached_roots: Option<Vec<Ref>>,
+) -> Result<Option<String>> {
+    let v = rpc
+        .call("core.library.get_images", json!({"uris": [uri]}))
+        .await?;
+    let native = largest_image(&v, uri);
+    if native.is_some() || !uri.starts_with("file:") {
+        return Ok(native);
+    }
+
+    // Mopidy's File backend supplies no images. Ask the indexed Local backend
+    // for the equivalent relative track URI without scanning any audio files.
+    let mut roots: Vec<Ref> = match cached_roots {
+        Some(roots) => roots,
+        None => serde_json::from_value(
+            rpc.call("core.library.browse", json!({"uri": null}))
+                .await?,
+        )?,
+    };
+    if !roots.iter().any(|r| r.uri.starts_with("local:")) {
+        return Ok(None);
+    }
+    if roots.iter().any(|r| r.uri == "file:root") {
+        let dirs: Vec<Ref> = serde_json::from_value(
+            rpc.call("core.library.browse", json!({"uri": "file:root"}))
+                .await?,
+        )?;
+        roots.extend(dirs);
+    }
+    roots.sort_by_key(|r| std::cmp::Reverse(r.uri.len()));
+    let mut seen = HashSet::new();
+    let aliases: Vec<String> = roots
+        .iter()
+        .filter_map(|r| local_art_uri(uri, &r.uri))
+        .filter(|alias| seen.insert(alias.clone()))
+        .collect();
+    if aliases.is_empty() {
+        return Ok(None);
+    }
+    let v = rpc
+        .call("core.library.get_images", json!({"uris": aliases}))
+        .await?;
+    Ok(aliases.iter().find_map(|alias| largest_image(&v, alias)))
+}
+
 pub fn flatten_lookup(v: &Value) -> Vec<Track> {
     v.as_object()
         .map(|m| {
@@ -2873,10 +3089,791 @@ fn se_matches(t: &Track, fields: &[String; 11], exact: bool) -> bool {
 mod tests {
     use super::*;
 
+    fn test_app() -> App {
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            Rpc::offline(),
+            Arc::new(Api::new("http://127.0.0.1:1".into(), None)),
+            tx,
+            PathBuf::new(),
+            PathBuf::new(),
+            false,
+            None,
+        );
+        app.prompt = None;
+        app
+    }
+
+    fn render_app(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn screen_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    fn current_track() -> TlTrack {
+        TlTrack {
+            tlid: 1,
+            track: Track {
+                uri: "local:track:now-playing".into(),
+                name: "Current song".into(),
+                artists: "Soloist".into(),
+                album_artists: "Orchestra".into(),
+                album: "Live recording".into(),
+                length: Some(120_000),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn scripted_rpc(
+        script: Vec<(&'static str, Value, Value)>,
+    ) -> (Arc<Rpc>, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = tokio_tungstenite::tungstenite::accept(stream).unwrap();
+            for (method, params, result) in script {
+                let message = socket.read().unwrap();
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], method);
+                assert_eq!(request["params"], params);
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .unwrap();
+            }
+        });
+        let (events, _) = mpsc::unbounded_channel();
+        (
+            Rpc::start(format!("ws://{address}/ws"), None, events),
+            server,
+        )
+    }
+
+    #[test]
+    fn files_artwork_alias_preserves_encoded_paths_and_respects_root_boundaries() {
+        assert_eq!(
+            local_art_uri(
+                "file:///mnt/Orchestra/Retupera%CC%88n%20WBK/Album/01%20Song%23.mp3",
+                "file:///mnt/Orchestra/",
+            )
+            .as_deref(),
+            Some("local:track:Retupera%CC%88n%20WBK/Album/01%20Song%23.mp3"),
+        );
+        for uri in [
+            "file:///mnt/Orchestra-other/Album/Song.mp3",
+            "file:///mnt/Orchestra",
+            "file:///mnt/Orchestra/Album/Song.mp3?other=true",
+            "file:///mnt/Orchestra/Album/Song.mp3#fragment",
+            "file://other-host/mnt/Orchestra/Album/Song.mp3",
+            "https://example.com/mnt/Orchestra/Album/Song.mp3",
+        ] {
+            assert_eq!(local_art_uri(uri, "file:///mnt/Orchestra"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn files_artwork_uses_indexed_local_cover_without_changing_track_uri() {
+        let uri = "file:///mnt/Orchestra/Artist/Album/Song.mp3";
+        let local = "local:track:Artist/Album/Song.mp3";
+        let roots = serde_json::from_value(json!([
+            {"type": "directory", "uri": "file:///mnt/Orchestra", "name": "Files"},
+            {"type": "directory", "uri": "local:directory", "name": "Local media"}
+        ]))
+        .unwrap();
+        let (rpc, server) = scripted_rpc(vec![
+            (
+                "core.library.get_images",
+                json!({"uris": [uri]}),
+                json!({uri: []}),
+            ),
+            (
+                "core.library.get_images",
+                json!({"uris": [local]}),
+                json!({local: [
+                    {"uri": "/local/small.jpg", "width": 100},
+                    {"uri": "/local/cover.png", "width": 600}
+                ]}),
+            ),
+        ]);
+        assert_eq!(
+            cover_image_url(&rpc, uri, Some(roots))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("/local/cover.png")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn files_artwork_discovers_multiple_configured_music_roots() {
+        let uri = "file:///other/music/Album/Song.mp3";
+        let local = "local:track:Album/Song.mp3";
+        let (rpc, server) = scripted_rpc(vec![
+            (
+                "core.library.get_images",
+                json!({"uris": [uri]}),
+                json!({uri: []}),
+            ),
+            (
+                "core.library.browse",
+                json!({"uri": null}),
+                json!([
+                    {"type": "directory", "uri": "file:root", "name": "Files"},
+                    {"type": "directory", "uri": "local:directory", "name": "Local media"}
+                ]),
+            ),
+            (
+                "core.library.browse",
+                json!({"uri": "file:root"}),
+                json!([
+                    {"type": "directory", "uri": "file:///mnt/music", "name": "Music"},
+                    {"type": "directory", "uri": "file:///other/music", "name": "More music"}
+                ]),
+            ),
+            (
+                "core.library.get_images",
+                json!({"uris": [local]}),
+                json!({local: [
+                    {"uri": "/local/cover.jpg", "width": 600}
+                ]}),
+            ),
+        ]);
+        assert_eq!(
+            cover_image_url(&rpc, uri, None).await.unwrap().as_deref(),
+            Some("/local/cover.jpg")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_artwork_urls_do_not_trigger_files_fallback() {
+        let uri = "tidal:track:123";
+        let (rpc, server) = scripted_rpc(vec![(
+            "core.library.get_images",
+            json!({"uris": [uri]}),
+            json!({uri: [
+                {"uri": "https://images.example/cover.jpg", "width": 600}
+            ]}),
+        )]);
+        assert_eq!(
+            cover_image_url(&rpc, uri, None).await.unwrap().as_deref(),
+            Some("https://images.example/cover.jpg")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_reset_clears_the_form_and_returns_to_any() {
+        let mut app = test_app();
+        app.screen = Screen::Search;
+        app.se_fields[0] = "Current song".into();
+        app.se_tracks = vec![current_track().track];
+        app.se.height = 4;
+        app.se_rebuild(false);
+        app.se.cursor = app
+            .se
+            .items
+            .iter()
+            .position(|item| matches!(item, SeItem::Reset))
+            .unwrap();
+        app.se.fix_offset();
+        assert!(app.se.offset > 0);
+
+        app.key(KeyEvent::new(K::Enter, KeyModifiers::NONE));
+        assert_eq!((app.se.cursor, app.se.offset), (0, 0));
+        assert!(matches!(app.se.cur(), Some(SeItem::Field(0))));
+        assert!(app.se_fields.iter().all(String::is_empty));
+        assert!(!app.se_has_results());
+    }
+
+    #[tokio::test]
+    async fn repeating_search_shortcut_resets_search_and_focuses_any() {
+        let mut app = test_app();
+        app.screen = Screen::Search;
+        app.se_fields[0] = "Current song".into();
+        app.se_tracks = vec![current_track().track];
+        app.se.height = 4;
+        app.se_rebuild(false);
+        app.se.sel[app.se.cursor] = true;
+        assert!(app.se.offset > 0);
+
+        app.key(KeyEvent::new(K::Char('3'), KeyModifiers::NONE));
+        assert_eq!((app.se.cursor, app.se.offset), (0, 0));
+        assert!(matches!(app.se.cur(), Some(SeItem::Field(0))));
+        assert!(app.se_fields.iter().all(String::is_empty));
+        assert!(!app.se_has_results());
+        assert_eq!(app.se.len(), App::se_static().len());
+        assert!(!app.se.any_sel());
+    }
+
+    #[tokio::test]
+    async fn switching_back_to_search_preserves_cursor_until_three_is_pressed_again() {
+        let mut app = test_app();
+        app.screen = Screen::Search;
+        app.se.cursor = 4;
+        app.se_fields[0] = "Current song".into();
+        app.key(KeyEvent::new(K::Char('1'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(K::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.screen, Screen::Search);
+        assert_eq!(app.se.cursor, 4);
+        assert_eq!(app.se_fields[0], "Current song");
+        app.key(KeyEvent::new(K::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.se.cursor, 0);
+        assert!(app.se_fields.iter().all(String::is_empty));
+        app.key(KeyEvent::new(K::Enter, KeyModifiers::NONE));
+        app.key(KeyEvent::new(K::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.prompt.as_ref().unwrap().buf, "3");
+    }
+
+    #[tokio::test]
+    async fn numbered_screens_use_the_new_layout() {
+        let mut app = test_app();
+        app.stats = Some(json!({}));
+        for (key, screen) in [
+            ('1', Screen::Playlist),
+            ('2', Screen::NowPlaying),
+            ('3', Screen::Search),
+            ('4', Screen::Browser),
+            ('5', Screen::Library),
+            ('6', Screen::Editor),
+            ('7', Screen::Stats),
+            ('8', Screen::Help),
+        ] {
+            app.key(KeyEvent::new(K::Char(key), KeyModifiers::NONE));
+            assert_eq!(app.screen, screen);
+        }
+        app.key(KeyEvent::new(K::Char('1'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(K::Tab, KeyModifiers::NONE));
+        assert_eq!(app.screen, Screen::Browser);
+        app.key(KeyEvent::new(K::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.screen, Screen::Playlist);
+    }
+
+    #[tokio::test]
+    async fn now_playing_renders_a_large_cover_album_artist_and_only_current_synced_line() {
+        let mut app = test_app();
+        app.screen = Screen::NowPlaying;
+        app.current = Some(current_track());
+        let uri = app.current.as_ref().unwrap().track.uri.clone();
+        app.art_cache.insert(
+            uri.clone(),
+            Some(image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                2,
+                2,
+                image::Rgb([30, 100, 180]),
+            ))),
+        );
+        app.lyrics = LyricsState::Loaded(
+            uri.clone(),
+            vec![
+                (Some(1_000), "Previous lyric".into()),
+                (Some(2_000), "The current lyric line".into()),
+                (Some(4_000), "Next lyric".into()),
+            ],
+        );
+        app.set_pos(2_500);
+        let buffer = render_app(&mut app, 120, 40);
+        let text = screen_text(&buffer);
+        assert!(text.contains("Now playing"));
+        assert!(text.contains("Current song"));
+        assert!(text.contains("Orchestra"));
+        assert!(text.contains("Live recording"));
+        assert!(text.contains("Track artist: Soloist"));
+        assert_eq!(app.current_lyric(), Some("The current lyric line"));
+        assert!(!text.contains("Previous lyric"));
+        assert!(!text.contains("Next lyric"));
+        let art_cells = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.bg != ratatui::style::Color::Reset)
+            .count();
+        assert!(
+            art_cells > 500,
+            "expected a large cover, got {art_cells} image cells"
+        );
+        let colored: Vec<(usize, usize)> = buffer
+            .content
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.bg != ratatui::style::Color::Reset)
+            .map(|(i, _)| (i % 120, i / 120))
+            .collect();
+        let left = colored.iter().map(|(x, _)| *x).min().unwrap();
+        let right = colored.iter().map(|(x, _)| *x).max().unwrap();
+        let bottom = colored.iter().map(|(_, y)| *y).max().unwrap();
+        assert!(
+            (left + right).abs_diff(119) <= 1,
+            "cover must be horizontally centered"
+        );
+        let row_of = |text: &str| {
+            buffer
+                .content
+                .chunks(120)
+                .enumerate()
+                .skip(3)
+                .find(|(_, row)| {
+                    row.iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains(text)
+                })
+                .map(|(y, _)| y)
+                .unwrap()
+        };
+        assert!(bottom < row_of("Current song"));
+        assert!(row_of("Current song") < row_of("Orchestra"));
+        assert!(row_of("Orchestra") < row_of("Live recording"));
+        assert!(text.contains("The current lyric line"));
+        let lyric_row = row_of("The current lyric line");
+        assert!(row_of("Live recording") < lyric_row);
+        let caption = &buffer.content[lyric_row * 120..(lyric_row + 1) * 120];
+        assert!(!caption.iter().any(|cell| cell.symbol() == "█"));
+        for cell in caption.iter().filter(|cell| cell.symbol() != " ") {
+            assert_eq!(cell.fg, ratatui::style::Color::LightYellow);
+            assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+        }
+        assert!(app.fb_blits.borrow().is_empty());
+
+        app.lyrics = LyricsState::Loaded(uri, vec![(None, "Plain lyrics must stay hidden".into())]);
+        let text = screen_text(&render_app(&mut app, 120, 40));
+        assert!(!text.contains("Plain lyrics must stay hidden"));
+        assert!(text.contains("No synced lyrics available"));
+    }
+
+    #[tokio::test]
+    async fn live_lyrics_use_normal_text_with_current_and_two_upcoming_lines_only() {
+        let mut app = test_app();
+        app.screen = Screen::Lyrics;
+        app.current = Some(current_track());
+        let uri = app.current.as_ref().unwrap().track.uri.clone();
+        app.lyrics = LyricsState::Loaded(
+            uri,
+            vec![
+                (Some(0), "Beginning of the song".into()),
+                (Some(1_000), "Earlier verse".into()),
+                (Some(2_000), "Previous cue".into()),
+                (Some(3_000), "We are here".into()),
+                (Some(4_000), "Next cue".into()),
+                (Some(5_000), "End of the song".into()),
+                (Some(6_000), "Later unseen verse".into()),
+            ],
+        );
+        app.set_pos(3_500);
+        let buffer = render_app(&mut app, 120, 40);
+        let text = screen_text(&buffer);
+        assert!(text.contains("Live lyrics"));
+        assert!(!text.contains("Previous cue"));
+        assert!(!text.contains("Beginning of the song"));
+        assert!(!text.contains("Earlier verse"));
+        assert!(!text.contains("Later unseen verse"));
+        assert!(!text.contains('█'));
+        let lyric_rows: Vec<_> = buffer
+            .content
+            .chunks(120)
+            .enumerate()
+            .filter_map(|(y, row)| {
+                let line: String = row.iter().map(|cell| cell.symbol()).collect();
+                let line = line.trim();
+                matches!(line, "We are here" | "Next cue" | "End of the song")
+                    .then(|| (y, line.to_string()))
+            })
+            .collect();
+        assert_eq!(
+            lyric_rows
+                .iter()
+                .map(|(_, line)| line.as_str())
+                .collect::<Vec<_>>(),
+            vec!["We are here", "Next cue", "End of the song"]
+        );
+        assert!(lyric_rows[0].0 > 3);
+        assert!(lyric_rows[2].0 < 38);
+        for (i, (y, _)) in lyric_rows.iter().enumerate() {
+            for cell in buffer.content[y * 120..(y + 1) * 120]
+                .iter()
+                .filter(|cell| cell.symbol() != " ")
+            {
+                assert_eq!(
+                    cell.fg,
+                    if i == 0 {
+                        ratatui::style::Color::LightYellow
+                    } else {
+                        ratatui::style::Color::Gray
+                    }
+                );
+                assert_eq!(
+                    cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                    i == 0
+                );
+            }
+        }
+        assert!(app.fb_blits.borrow().is_empty());
+
+        for key in [
+            K::Down,
+            K::Up,
+            K::PageDown,
+            K::PageUp,
+            K::Char('j'),
+            K::Char('k'),
+        ] {
+            app.key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert_eq!(app.current_lyric(), Some("We are here"));
+        }
+        assert_eq!(render_app(&mut app, 120, 40), buffer);
+        app.on_event(json!({"event": "seeked", "time_position": 4_500}));
+        assert_eq!(app.current_lyric(), Some("Next cue"));
+        assert_ne!(render_app(&mut app, 120, 40), buffer);
+    }
+
+    #[tokio::test]
+    async fn live_lyrics_preview_first_two_lines_before_the_first_timestamp() {
+        let mut app = test_app();
+        app.screen = Screen::Lyrics;
+        app.current = Some(current_track());
+        let uri = app.current.as_ref().unwrap().track.uri.clone();
+        app.lyrics = LyricsState::Loaded(
+            uri,
+            vec![
+                (Some(10_000), "第一行".into()),
+                (Some(20_000), "第二行".into()),
+                (Some(30_000), "第三行".into()),
+            ],
+        );
+        app.set_pos(0);
+        let text = screen_text(&render_app(&mut app, 120, 40)).replace(' ', "");
+        assert!(text.contains('♪'));
+        assert!(text.contains("第一行"));
+        assert!(text.contains("第二行"));
+        assert!(!text.contains("第三行"));
+        app.set_pos(10_000);
+        let text = screen_text(&render_app(&mut app, 120, 40)).replace(' ', "");
+        assert!(!text.contains('♪'));
+        for line in ["第一行", "第二行", "第三行"] {
+            assert!(text.contains(line));
+        }
+    }
+
+    #[tokio::test]
+    async fn live_lyrics_handle_plain_text_fallback_and_narrow_windows() {
+        let mut app = test_app();
+        app.screen = Screen::Lyrics;
+        app.current = Some(current_track());
+        let uri = app.current.as_ref().unwrap().track.uri.clone();
+        app.lyrics = LyricsState::Loaded(uri.clone(), vec![(Some(0), "你好，世界".into())]);
+        assert!(screen_text(&render_app(&mut app, 80, 24))
+            .replace(' ', "")
+            .contains("你好，世界"));
+        app.lyrics = LyricsState::Loaded(
+            uri.clone(),
+            vec![(None, "Entire unsynced song must stay hidden".into())],
+        );
+        let text = screen_text(&render_app(&mut app, 80, 24));
+        assert!(text.contains("No synced lyrics available"));
+        assert!(!text.contains("Entire unsynced song"));
+        app.lyrics = LyricsState::Loaded(
+            uri.clone(),
+            vec![(
+                Some(0),
+                "A long lyric that must fit without losing the current line".into(),
+            )],
+        );
+        for width in [10, 24, 60, 80, 120] {
+            for height in [5, 6, 10, 24, 40] {
+                render_app(&mut app, width, height);
+            }
+        }
+        app.art_cache.insert(uri, None);
+        app.key(KeyEvent::new(K::Char('2'), KeyModifiers::NONE));
+        app.key(KeyEvent::new(K::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.screen, Screen::Lyrics);
+        app.key(KeyEvent::new(K::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.screen, Screen::NowPlaying);
+    }
+
+    #[tokio::test]
+    async fn now_playing_handles_missing_media_and_small_terminals() {
+        let mut app = test_app();
+        app.screen = Screen::NowPlaying;
+        assert!(screen_text(&render_app(&mut app, 80, 24)).contains("Nothing playing"));
+        app.current = Some(current_track());
+        let uri = app.current.as_ref().unwrap().track.uri.clone();
+        app.art_cache.insert(uri.clone(), None);
+        app.lyrics = LyricsState::Failed(uri);
+        let text = screen_text(&render_app(&mut app, 120, 40));
+        assert!(text.contains("(no album art)"));
+        assert!(text.contains("Synced lyrics unavailable"));
+        assert!(text.contains("Current song"));
+        for width in [10, 24, 60, 80, 120] {
+            for height in [5, 6, 10, 24, 40] {
+                render_app(&mut app, width, height);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn synced_lyric_tracks_seeking_pause_and_current_uri() {
+        let mut app = test_app();
+        app.current = Some(current_track());
+        app.state = PlayState::Paused;
+        let uri = app.current.as_ref().unwrap().track.uri.clone();
+        app.lyrics = LyricsState::Loaded(
+            uri,
+            vec![
+                (Some(1_000), "First line".into()),
+                (Some(2_000), "Second line".into()),
+            ],
+        );
+        assert_eq!(app.current_lyric(), None);
+        app.on_event(json!({"event": "seeked", "time_position": 1_500}));
+        assert_eq!(app.current_lyric(), Some("First line"));
+        app.on_event(json!({"event": "seeked", "time_position": 2_500}));
+        assert_eq!(app.current_lyric(), Some("Second line"));
+        app.on_event(json!({"event": "seeked", "time_position": 500}));
+        assert_eq!(app.current_lyric(), None);
+        app.current.as_mut().unwrap().track.uri = "local:track:another-song".into();
+        app.set_pos(2_500);
+        assert_eq!(app.current_lyric(), None);
+    }
+
+    #[tokio::test]
+    async fn now_playing_loads_current_media_and_ignores_old_lyric_results() {
+        let mut app = test_app();
+        app.current = Some(current_track());
+        let first = app.current.as_ref().unwrap().track.uri.clone();
+        app.key(KeyEvent::new(K::Char('2'), KeyModifiers::NONE));
+        assert!(app.art_loading.contains(&first));
+        assert!(matches!(&app.lyrics, LyricsState::Fetching(uri) if *uri == first));
+
+        app.on_event(json!({"event": "track_playback_started", "tl_track": {
+            "tlid": 2, "track": {"uri": "local:track:next", "name": "Next song"}
+        }}));
+        assert!(app.art_loading.contains("local:track:next"));
+        assert!(matches!(&app.lyrics, LyricsState::Fetching(uri) if uri == "local:track:next"));
+        app.on_msg(Msg::Lyrics(
+            first,
+            Ok(Lyrics {
+                synced: Some("[00:00.00] Wrong song".into()),
+                plain: None,
+            }),
+        ));
+        assert_eq!(app.current_lyric(), None);
+        assert!(matches!(&app.lyrics, LyricsState::Fetching(uri) if uri == "local:track:next"));
+        app.on_msg(Msg::Lyrics(
+            "local:track:next".into(),
+            Ok(Lyrics {
+                synced: Some("[00:00.00] Correct song".into()),
+                plain: None,
+            }),
+        ));
+        assert_eq!(app.current_lyric(), Some("Correct song"));
+
+        app.on_event(json!({"event": "playback_state_changed", "new_state": "stopped"}));
+        assert!(matches!(app.lyrics, LyricsState::Idle));
+        assert_eq!(app.current_lyric(), None);
+    }
+
+    #[tokio::test]
+    async fn failed_lyrics_complete_loading_without_automatic_retry_loops() {
+        let mut app = test_app();
+        app.screen = Screen::NowPlaying;
+        app.current = Some(current_track());
+        let uri = app.current.as_ref().unwrap().track.uri.clone();
+        app.art_cache.insert(uri.clone(), None);
+        app.lyrics = LyricsState::Fetching(uri.clone());
+        app.on_msg(Msg::Lyrics(uri.clone(), Err("Network unavailable".into())));
+        app.tick();
+        assert!(matches!(&app.lyrics, LyricsState::Failed(u) if *u == uri));
+        assert!(app
+            .message
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("Network unavailable"));
+    }
+
+    #[tokio::test]
+    async fn eight_and_f1_open_the_scrollable_key_bindings_screen() {
+        for shortcut in [K::Char('8'), K::F(1)] {
+            let mut app = test_app();
+            app.screen = Screen::Browser;
+            app.key(KeyEvent::new(shortcut, KeyModifiers::NONE));
+            assert_eq!(app.screen, Screen::Help);
+            assert_eq!(app.prev_screen, Screen::Browser);
+
+            let backend = ratatui::backend::TestBackend::new(100, 30);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(rendered.contains("Help"));
+            assert!(rendered.contains("Keys - Movement"));
+
+            app.key(KeyEvent::new(K::Down, KeyModifiers::NONE));
+            assert_eq!(app.help_offset, 1);
+            app.key(KeyEvent::new(K::PageDown, KeyModifiers::NONE));
+            assert_eq!(app.help_offset, 11);
+            app.key(KeyEvent::new(K::PageUp, KeyModifiers::NONE));
+            assert_eq!(app.help_offset, 1);
+            app.key(KeyEvent::new(K::Up, KeyModifiers::NONE));
+            assert_eq!(app.help_offset, 0);
+
+            app.key(KeyEvent::new(K::Char('4'), KeyModifiers::NONE));
+            assert_eq!(app.screen, Screen::Browser);
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_arrows_and_existing_keys_navigate_folders() {
+        for (into, up) in [(K::Right, K::Left), (K::Enter, K::Backspace)] {
+            let mut app = test_app();
+            app.screen = Screen::Browser;
+            app.volume = 50;
+            let files = Ref {
+                kind: "directory".into(),
+                uri: "file:///music".into(),
+                name: "Files".into(),
+            };
+            let album = Ref {
+                kind: "directory".into(),
+                uri: "file:///music/Album".into(),
+                name: "Album".into(),
+            };
+            app.cache_browse(
+                String::new(),
+                vec![
+                    Ref {
+                        kind: "directory".into(),
+                        uri: "local:directory".into(),
+                        name: "Local media".into(),
+                    },
+                    files.clone(),
+                ],
+            );
+            app.cache_browse(files.uri.clone(), vec![album.clone()]);
+            app.cache_browse(album.uri.clone(), vec![]);
+            app.browse_load();
+
+            app.key(KeyEvent::new(K::Down, KeyModifiers::NONE));
+            app.key(KeyEvent::new(into, KeyModifiers::NONE));
+            assert_eq!(app.browse_path(), "/Files");
+            assert_eq!(app.browse_uri().as_deref(), Some(files.uri.as_str()));
+
+            app.key(KeyEvent::new(K::Down, KeyModifiers::NONE));
+            app.key(KeyEvent::new(into, KeyModifiers::NONE));
+            assert_eq!(app.browse_path(), "/Files/Album");
+            assert_eq!(app.browse_uri().as_deref(), Some(album.uri.as_str()));
+
+            app.key(KeyEvent::new(up, KeyModifiers::NONE));
+            assert_eq!(app.browse_path(), "/Files");
+            assert_eq!(app.browser.cursor, 1);
+            assert_eq!(app.browser.cur(), Some(&album));
+
+            app.key(KeyEvent::new(up, KeyModifiers::NONE));
+            assert_eq!(app.browse_path(), "/");
+            assert_eq!(app.browser.cursor, 1);
+            assert_eq!(app.browser.cur(), Some(&files));
+
+            app.key(KeyEvent::new(up, KeyModifiers::NONE));
+            assert_eq!(app.browse_stack.len(), 1);
+            assert_eq!(app.volume, 50);
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_arrows_handle_nonfolders_and_empty_lists() {
+        let mut app = test_app();
+        app.screen = Screen::Browser;
+        app.volume = 50;
+        for kind in ["track", "parent"] {
+            let item = Ref {
+                kind: kind.into(),
+                uri: "file:///music/song.mp3".into(),
+                name: "Song".into(),
+            };
+            app.browser.set(vec![item.clone()]);
+            app.key(KeyEvent::new(K::Right, KeyModifiers::NONE));
+            assert_eq!(app.browse_stack.len(), 1);
+            assert_eq!(app.browser.cur(), Some(&item));
+        }
+
+        app.browser.set(vec![]);
+        app.key(KeyEvent::new(K::Right, KeyModifiers::NONE));
+        app.key(KeyEvent::new(K::Left, KeyModifiers::NONE));
+        assert_eq!(app.browse_stack.len(), 1);
+        assert!(app.browser.is_empty());
+
+        app.cache_browse(String::new(), vec![]);
+        app.browse_stack
+            .push((Some("file:///music".into()), "Files".into(), 0));
+        app.key(KeyEvent::new(K::Left, KeyModifiers::NONE));
+        assert_eq!(app.browse_stack.len(), 1);
+        assert!(app.browser.is_empty());
+        assert_eq!(app.volume, 50);
+    }
+
+    #[tokio::test]
+    async fn browser_navigation_preserves_other_screens_and_volume_keys() {
+        let mut app = test_app();
+        app.volume = 50;
+        app.screen = Screen::Browser;
+        app.key(KeyEvent::new(K::Char('+'), KeyModifiers::NONE));
+        assert_eq!(app.volume, 50 + VOL_STEP);
+        app.key(KeyEvent::new(K::Char('-'), KeyModifiers::NONE));
+        assert_eq!(app.volume, 50);
+
+        app.screen = Screen::Playlist;
+        app.key(KeyEvent::new(K::Right, KeyModifiers::NONE));
+        assert_eq!(app.volume, 50 + VOL_STEP);
+        app.key(KeyEvent::new(K::Left, KeyModifiers::NONE));
+        assert_eq!(app.volume, 50);
+
+        for screen in [Screen::Library, Screen::Editor] {
+            app.screen = screen;
+            app.key(KeyEvent::new(K::Right, KeyModifiers::NONE));
+            assert_eq!(app.lib_col, usize::from(screen == Screen::Library));
+            assert_eq!(app.ed_col, usize::from(screen == Screen::Editor));
+            app.key(KeyEvent::new(K::Left, KeyModifiers::NONE));
+        }
+        assert_eq!((app.lib_col, app.ed_col), (0, 0));
+        assert_eq!(app.volume, 50);
+    }
+
+    #[tokio::test]
+    async fn failed_cover_completes_loading_instead_of_getting_stuck() {
+        let mut app = test_app();
+        let uri = "local:track:song.mp3".to_string();
+        app.art_loading.insert(uri.clone());
+        app.on_msg(Msg::Cover(uri.clone(), Err("HTTP 404".into())));
+        assert!(!app.art_loading.contains(&uri));
+        assert!(matches!(app.art_cache.get(&uri), Some(None)));
+        assert!(app.message.as_ref().unwrap().0.contains("HTTP 404"));
+    }
+
     #[test]
     fn menu_scrolls_classically_and_skips_inactive() {
-        let mut m: Menu<i32> = Menu::default();
-        m.height = 3;
+        let mut m: Menu<i32> = Menu {
+            height: 3,
+            ..Default::default()
+        };
         m.set((0..10).collect());
         m.mv(4);
         assert_eq!((m.cursor, m.offset), (4, 2));
@@ -2909,5 +3906,168 @@ mod tests {
         f[1] = "Nas".into();
         f[4] = "Illmatic".into();
         assert!(se_matches(&t, &f, true));
+    }
+
+    #[tokio::test]
+    async fn browsing_limits_metadata_and_retries_only_after_invalidation() {
+        let mut app = test_app();
+        app.connected = true;
+        app.screen = Screen::Browser;
+        app.browser.height = 20;
+        app.browser.set(
+            (0..10_000)
+                .map(|i| Ref {
+                    kind: "track".into(),
+                    uri: format!("file:{i}"),
+                    name: format!("Song {i}"),
+                })
+                .collect(),
+        );
+        app.ensure_visible_metadata();
+        assert_eq!(app.metadata_pending.len(), 40);
+        app.ensure_visible_metadata();
+        assert_eq!(app.metadata_batches, 1);
+        app.browser.offset = 500;
+        app.ensure_visible_metadata();
+        app.browser.offset = 1000;
+        app.ensure_visible_metadata();
+        assert_eq!(app.metadata_batches, 2);
+        assert_eq!(app.metadata_pending.len(), 80);
+        assert!(!app.metadata_pending.contains("file:1000"));
+        let failed: Vec<String> = (0..40).map(|i| format!("file:{i}")).collect();
+        app.on_msg(Msg::Metadata(
+            failed.clone(),
+            app.library_generation,
+            Err("timeout".into()),
+        ));
+        app.browser.offset = 0;
+        app.ensure_visible_metadata();
+        assert_eq!(
+            app.metadata_batches, 1,
+            "failed rows must not retry on every draw"
+        );
+        app.invalidate_library();
+        app.ensure_visible_metadata();
+        assert_eq!(app.metadata_pending.len(), 40);
+        app.on_msg(Msg::Metadata(
+            failed,
+            app.library_generation - 1,
+            Ok(vec![]),
+        ));
+        assert_eq!(
+            app.metadata_pending.len(),
+            40,
+            "stale completion must not clear new requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_navigation_deduplicates_and_isolates_stale_results() {
+        let mut app = test_app();
+        app.screen = Screen::Browser;
+        app.cache_browse(String::new(), vec![]);
+        app.browse_into("a".into(), "A".into());
+        app.browse_load();
+        assert_eq!(app.browse_pending.len(), 1);
+        app.browse_up();
+        assert!(!app.browse_loading, "Back to a cached folder is immediate");
+        app.browse_into("b".into(), "B".into());
+        app.on_msg(Msg::Browsed("a".into(), 0, Ok(vec![])));
+        assert!(
+            app.browse_loading,
+            "another folder must not stop the spinner"
+        );
+        app.invalidate_library();
+        app.on_msg(Msg::Browsed("b".into(), 0, Ok(vec![])));
+        assert!(app.browse_loading);
+        assert!(app.browse_pending.contains("b"));
+        app.on_msg(Msg::Browsed(
+            "b".into(),
+            app.library_generation,
+            Err("failed".into()),
+        ));
+        assert!(!app.browse_loading);
+        assert!(!app.browse_pending.contains("b"));
+        assert!(app.message.as_ref().unwrap().0.contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn render_cache_reuses_pixels_and_invalidates_content_and_geometry() {
+        let mut app = test_app();
+        app.screen = Screen::NowPlaying;
+        app.pixel_size = Some((960, 640));
+        app.current = Some(current_track());
+        let uri = app.current.as_ref().unwrap().track.uri.clone();
+        app.art_cache
+            .insert(uri.clone(), Some(image::DynamicImage::new_rgb8(100, 100)));
+        app.lyrics = LyricsState::Loaded(uri.clone(), vec![(Some(0), "First line".into())]);
+        let first = render_app(&mut app, 120, 40);
+        let before = app.fb_blits.borrow().clone();
+        assert_eq!(before.len(), 2);
+        assert_eq!(first, render_app(&mut app, 120, 40));
+        for (a, b) in before.iter().zip(app.fb_blits.borrow().iter()) {
+            assert!(Arc::ptr_eq(&a.rgb, &b.rgb));
+            assert_eq!(a.area(), b.area());
+        }
+        app.lyrics = LyricsState::Loaded(uri, vec![(Some(0), "Next line".into())]);
+        render_app(&mut app, 120, 40);
+        assert!(Arc::ptr_eq(&before[0].rgb, &app.fb_blits.borrow()[0].rgb));
+        assert!(!Arc::ptr_eq(&before[1].rgb, &app.fb_blits.borrow()[1].rgb));
+        app.on_msg(Msg::Cover("other".into(), Ok(None)));
+        render_app(&mut app, 120, 40);
+        assert!(!Arc::ptr_eq(&before[0].rgb, &app.fb_blits.borrow()[0].rgb));
+        app.pixel_size = Some((1280, 800));
+        render_app(&mut app, 160, 50);
+        for (a, b) in before.iter().zip(app.fb_blits.borrow().iter()) {
+            assert!(!Arc::ptr_eq(&a.rgb, &b.rgb));
+            assert_eq!(b.rgb.len(), b.w as usize * b.h as usize * 3);
+        }
+    }
+
+    /// Repeatable CPU-only rendering workload; run in release mode with --ignored --nocapture.
+    #[tokio::test]
+    #[ignore = "manual rendering benchmark"]
+    async fn rendering_benchmark() {
+        let mut app = test_app();
+        app.current = Some(current_track());
+        let uri = app.current.as_ref().unwrap().track.uri.clone();
+        app.art_cache.insert(
+            uri.clone(),
+            Some(image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(
+                600,
+                600,
+                |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]),
+            ))),
+        );
+        app.lyrics = LyricsState::Loaded(uri, vec![(Some(0), "Anna musiikin soida".into())]);
+        app.browser.set(
+            (0..10_000)
+                .map(|i| Ref {
+                    kind: "directory".into(),
+                    uri: format!("file:///music/{i}"),
+                    name: format!("Album {i}"),
+                })
+                .collect(),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        for (label, screen, pixels) in [
+            ("browser 10k", Screen::Browser, None),
+            ("terminal cover", Screen::NowPlaying, None),
+            ("pixel cover + lyric", Screen::NowPlaying, Some((960, 640))),
+        ] {
+            app.screen = screen;
+            app.pixel_size = pixels;
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let start = Instant::now();
+            for _ in 0..100 {
+                terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+                std::hint::black_box(terminal.backend().buffer());
+            }
+            println!(
+                "{label}: {:.3} ms/frame (100 warm frames)",
+                start.elapsed().as_secs_f64() * 10.0
+            );
+        }
     }
 }

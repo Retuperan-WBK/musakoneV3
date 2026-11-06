@@ -4,10 +4,11 @@
 //! statusbar "Playing: song" + "[elapsed/total]".
 use crate::app::*;
 use crate::model::{fmt_long, fmt_ms, Track};
-use ratatui::layout::Rect;
+use crate::pixels::ANSI16;
+use ratatui::layout::{Alignment, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -19,6 +20,49 @@ const PROGRESS: Color = Color::DarkGray; // progressbar_color black:b
 const PROGRESS_ELAPSED: Color = Color::Green; // progressbar_elapsed_color
 const STATUSBAR: Color = Color::Yellow; // statusbar_color = yellow
 const STATE_LINE: Color = Color::Red; // state_line_color = red
+
+pub struct RenderCache {
+    covers: crate::cache::Cache<CoverKey, CoverRender>,
+    lyrics: crate::cache::Cache<LyricKey, Option<crate::fb::Blit>>,
+}
+
+impl Default for RenderCache {
+    fn default() -> Self {
+        Self {
+            covers: crate::cache::Cache::new(4, 16 * 1024 * 1024),
+            lyrics: crate::cache::Cache::new(8, 8 * 1024 * 1024),
+        }
+    }
+}
+
+impl RenderCache {
+    pub fn clear_covers(&mut self) {
+        self.covers.clear();
+    }
+}
+
+#[derive(PartialEq)]
+struct CoverKey {
+    uri: String,
+    width: u32,
+    height: u32,
+    mode: ArtMode,
+}
+
+#[derive(Clone)]
+enum CoverRender {
+    Pixels(crate::fb::Blit),
+    Cells(Text<'static>),
+}
+
+#[derive(PartialEq)]
+struct LyricKey {
+    text: String,
+    width: u32,
+    height: u32,
+    max_px: u16,
+    color: [u8; 3],
+}
 
 struct Row<'a> {
     spans: Vec<Span<'a>>,
@@ -77,6 +121,7 @@ impl<'a> Row<'a> {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    app.fb_blits.borrow_mut().clear();
     let area = f.area();
     if area.height < 5 || area.width < 10 {
         return;
@@ -104,11 +149,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // Menus need their window height before scrolling can be resolved.
     size_menus(app, main);
+    app.ensure_visible_metadata();
 
     draw_alt_header(f, np0, np1, divider, app);
     match app.screen {
         Screen::Help => draw_help(f, main, app),
         Screen::Playlist => draw_playlist(f, main, app),
+        Screen::NowPlaying => draw_now_playing(f, main, app),
         Screen::Browser => draw_browser(f, main, app),
         Screen::Search => draw_search(f, main, app),
         Screen::Library => draw_library(f, main, app),
@@ -118,6 +165,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_progress(f, bar, app);
     draw_statusbar(f, status, app);
+    if app.popup.is_some() || app.info.is_some() {
+        // A main-window pixel overlay must never paint over a popup's text.
+        app.fb_blits.borrow_mut().clear();
+    }
     if let Some(p) = &app.popup {
         draw_popup(f, area, p);
     }
@@ -177,6 +228,7 @@ fn draw_info(f: &mut Frame, area: Rect, app: &App, uri: &str, rows: &[(String, S
                 },
                 img,
                 app,
+                uri,
             );
         }
         Rect {
@@ -244,6 +296,7 @@ fn screen_title(app: &App, avail: usize) -> String {
     match app.screen {
         Screen::Stats => "Stats".to_string(),
         Screen::Help => "Help".to_string(),
+        Screen::NowPlaying => "Now playing".to_string(),
         Screen::Playlist => {
             let n = app.queue.len();
             let mut stats = format!("({n} {}", if n == 1 { "item" } else { "items" });
@@ -267,7 +320,7 @@ fn screen_title(app: &App, avail: usize) -> String {
         Screen::Search => "Search engine".into(),
         Screen::Library => "Media library".into(),
         Screen::Editor => "Playlist editor".into(),
-        Screen::Lyrics => "Lyrics".into(),
+        Screen::Lyrics => "Live lyrics".into(),
     }
 }
 
@@ -991,8 +1044,8 @@ fn draw_search_preview(f: &mut Frame, area: Rect, app: &App, t: &Track) {
             height: art_h,
             ..area
         };
-        match art_for(app, &t.uri) {
-            Some(Some(img)) => render_cover(f, art_area, img, app),
+        match app.art_cache.get(&t.uri) {
+            Some(Some(img)) => render_cover(f, art_area, img, app, &t.uri),
             Some(None) => f.render_widget(
                 Paragraph::new("\n(no album art)")
                     .alignment(ratatui::layout::Alignment::Center)
@@ -1219,50 +1272,239 @@ fn draw_editor(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-// ---------- lyrics ----------
+// ---------- now playing / artwork ----------
 
-/// Album art rendered with Unicode upper-half-blocks: two vertical pixels per cell,
-/// foreground = top pixel, background = bottom pixel, so each cell shows two colours.
-/// Art state for a uri: Some(Some(img)) ready, Some(None) no art, None still loading.
-fn art_for<'a>(app: &'a App, uri: &str) -> Option<&'a Option<image::DynamicImage>> {
-    app.art_cache.get(uri)
+fn draw_now_playing(f: &mut Frame, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Some(current) = &app.current else {
+        f.render_widget(
+            Paragraph::new("Nothing playing. Choose a song from the playlist or library.")
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(MAIN)),
+            Rect {
+                y: area.y + area.height / 2,
+                height: area.height - area.height / 2,
+                ..area
+            },
+        );
+        return;
+    };
+    let t = &current.track;
+    let inner = area.inner(Margin::new(2, 1));
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let title = if t.name.is_empty() {
+        t.filename()
+    } else {
+        plain(&t.name)
+    };
+    let artist = if t.album_artist().is_empty() {
+        "Unknown artist"
+    } else {
+        t.album_artist()
+    };
+    let album = if t.album.is_empty() {
+        "Unknown album"
+    } else {
+        &t.album
+    };
+    let mut album = plain(album);
+    if !t.date.is_empty() {
+        album += &format!(" ({})", plain(&t.date));
+    }
+    let mut lines = vec![
+        Line::styled(title, bold.fg(NOW)),
+        Line::styled(plain(artist), bold.fg(Color::Yellow)),
+        Line::styled(album, Style::default().fg(Color::Cyan)),
+    ];
+    if !t.artists.is_empty() && t.artists != t.album_artist() {
+        lines.push(Line::styled(
+            format!("Track artist: {}", plain(&t.artists)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    // One centered column at every terminal width: cover, details, current lyric.
+    // Reserve the text first and let the square cover fill the remaining height.
+    let column = Rect {
+        x: inner.x + inner.width.saturating_sub(120) / 2,
+        width: inner.width.min(120),
+        ..inner
+    };
+    let metadata_rows: usize = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(column.width as usize))
+        .sum();
+    let metadata_h =
+        (metadata_rows.saturating_add(1).min(u16::MAX as usize) as u16).min(column.height);
+    let remaining = column.height.saturating_sub(metadata_h);
+    // Fixed reservation: the cover and metadata never jump when a lyric changes,
+    // wraps, loads or becomes unavailable.
+    let lyric_h = remaining.min(5);
+    let lyric_gap = u16::from(column.height > metadata_h + lyric_h && lyric_h > 0);
+    let available_art = column
+        .height
+        .saturating_sub(metadata_h + lyric_h + lyric_gap);
+    let art_h = available_art.saturating_sub(1).min(column.width / 2);
+    let art_gap = u16::from(art_h > 0);
+    let used_h = art_h + art_gap + metadata_h + lyric_gap + lyric_h;
+    let top = column.y + column.height.saturating_sub(used_h) / 2;
+    let art_area = Rect {
+        y: top,
+        height: art_h,
+        ..column
+    };
+    if art_h > 0 {
+        match app.art_cache.get(&t.uri) {
+            Some(Some(img)) => render_cover(f, art_area, img, app, &t.uri),
+            art => f.render_widget(
+                Paragraph::new(if art.is_some() {
+                    "(no album art)"
+                } else {
+                    "loading album art..."
+                })
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray)),
+                Rect {
+                    y: top + art_h / 2,
+                    height: 1,
+                    ..art_area
+                },
+            ),
+        }
+    }
+    let metadata_y = top + art_h + art_gap;
+    f.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        Rect {
+            y: metadata_y,
+            height: metadata_h,
+            ..column
+        },
+    );
+    draw_current_lyric(
+        f,
+        Rect {
+            y: metadata_y + metadata_h + lyric_gap,
+            height: lyric_h,
+            ..column
+        },
+        app,
+        &t.uri,
+        LyricRole::Caption,
+    );
 }
 
-/// Render a square album image centred in `area` using truecolor half-blocks.
-/// True when the terminal supports 24-bit colour. The Linux text console does not,
-/// and emitting RGB there both fails and corrupts later colours, so we fall back to
-/// character-based ASCII art. MUSAKONE_ASCII=1 forces ASCII, =0 forces colour.
-fn truecolor() -> bool {
-    match std::env::var("MUSAKONE_ASCII").as_deref() {
-        Ok("1") => return false,
-        Ok("0") => return true,
-        _ => {}
+#[derive(Clone, Copy)]
+enum LyricRole {
+    Caption,
+    Current,
+    Upcoming,
+}
+
+fn current_lyric_text<'a>(app: &'a App, uri: &str) -> (&'a str, bool) {
+    match &app.lyrics {
+        LyricsState::Loaded(u, lines) if u == uri && lines.iter().any(|(ts, _)| ts.is_some()) => (
+            app.current_lyric()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("♪"),
+            true,
+        ),
+        LyricsState::Loaded(u, _) if u == uri => ("No synced lyrics available", false),
+        LyricsState::Failed(u) if u == uri => ("Synced lyrics unavailable", false),
+        _ => ("Looking for synced lyrics...", false),
     }
-    let ct = std::env::var("COLORTERM").unwrap_or_default();
-    ct.contains("truecolor") || ct.contains("24bit")
+}
+
+fn draw_current_lyric(f: &mut Frame, area: Rect, app: &App, uri: &str, role: LyricRole) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let (text, synced) = current_lyric_text(app, uri);
+    if synced {
+        draw_lyric_line(f, area, app, text, role);
+    } else {
+        f.render_widget(
+            Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+    }
+}
+
+fn draw_lyric_line(f: &mut Frame, area: Rect, app: &App, text: &str, role: LyricRole) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let text = plain(text);
+    let highlighted = !matches!(role, LyricRole::Upcoming);
+    let style = if highlighted {
+        Style::default().fg(NOW).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    if let Some(size) = app.pixel_size {
+        if let Some(pixels) = crate::pixels::cell_area(size, f.area(), area) {
+            let cell_h = size.1 / f.area().height as u32;
+            // 28px captions/upcoming lines and 48px main lyrics on an 8x16 console.
+            let max_px = if matches!(role, LyricRole::Current) {
+                cell_h * 3
+            } else {
+                cell_h * 7 / 4
+            };
+            let color = if highlighted {
+                [255, 255, 85]
+            } else {
+                [170; 3]
+            };
+            let key = LyricKey {
+                text: text.clone(),
+                width: pixels.w,
+                height: pixels.h,
+                max_px: max_px.min(160) as u16,
+                color,
+            };
+            let mut cache = app.render_cache.borrow_mut();
+            let blit = match cache.lyrics.get(&key) {
+                Some(cached) => cached,
+                None => {
+                    let blit = crate::pixels::text(&text, pixels.w, pixels.h, key.max_px, color)
+                        .map(|image| crate::fb::Blit::image(0, 0, image));
+                    let bytes = blit.as_ref().map_or(0, |b| b.rgb.len()) + text.len();
+                    cache.lyrics.insert(key, blit.clone(), bytes);
+                    blit
+                }
+            };
+            if let Some(mut blit) = blit {
+                blit.x = pixels.x;
+                blit.y = pixels.y;
+                f.render_widget(Clear, area);
+                app.fb_blits.borrow_mut().push(blit);
+                return;
+            }
+        }
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .style(style),
+        area,
+    );
 }
 
 const ASCII_RAMP: &[u8] = b" .,:;irsXA253hMHGS#9B&@";
 
-/// Standard ANSI 16-colour palette (RGB) for quantising art on the Linux console.
-const ANSI16: [(u8, u8, u8); 16] = [
-    (0, 0, 0),
-    (170, 0, 0),
-    (0, 170, 0),
-    (170, 85, 0),
-    (0, 0, 170),
-    (170, 0, 170),
-    (0, 170, 170),
-    (170, 170, 170),
-    (85, 85, 85),
-    (255, 85, 85),
-    (85, 255, 85),
-    (255, 255, 85),
-    (85, 85, 255),
-    (255, 85, 255),
-    (85, 255, 255),
-    (255, 255, 255),
-];
 // 4x4 Bayer matrix for ordered dithering (spreads quantisation error -> more apparent depth).
 const BAYER4: [[i32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
@@ -1287,9 +1529,9 @@ fn cells16() -> &'static [Cell16] {
         let mut v = Vec::with_capacity(8 * 16 * COVERAGE.len());
         // Backgrounds: the console only honours the 8 dark colours for bg.
         for bg in 0..8u8 {
-            let (br, bgc, bb) = ANSI16[bg as usize];
+            let [br, bgc, bb] = ANSI16[bg as usize];
             for fg in 0..16u8 {
-                let (fr, fgc, fb) = ANSI16[fg as usize];
+                let [fr, fgc, fb] = ANSI16[fg as usize];
                 for (cov, glyph) in COVERAGE {
                     // Space ignores fg and full block ignores bg: only emit each once.
                     if (cov == 0.0 && fg != 0) || (cov == 1.0 && bg != 0) {
@@ -1338,15 +1580,17 @@ enum ArtMode {
     Ascii,
 }
 
-fn art_mode() -> ArtMode {
+fn art_mode(app: &App) -> ArtMode {
+    if app.pixel_size.is_some() {
+        return ArtMode::Fb;
+    }
     match std::env::var("MUSAKONE_ASCII").as_deref() {
         Ok("1") | Ok("ascii") => return ArtMode::Ascii,
         Ok("0") => return ArtMode::True,
         _ => {}
     }
-    if crate::fb::get().is_some() {
-        ArtMode::Fb
-    } else if truecolor() {
+    let ct = std::env::var("COLORTERM").unwrap_or_default();
+    if ct.contains("truecolor") || ct.contains("24bit") {
         ArtMode::True
     } else {
         // 16-colour console: blend fg/bg through the glyphs its font actually has.
@@ -1357,52 +1601,52 @@ fn art_mode() -> ArtMode {
 /// Framebuffer path: map the cell rect to screen pixels, scale the cover to fill a
 /// square inside it, record the blit, and leave the cells blank so text never lands
 /// on top of the image.
-fn render_cover_fb(f: &mut Frame, area: Rect, img: &image::DynamicImage, app: &App) {
-    let Some(fb) = crate::fb::get() else { return };
-    let term = f.area();
-    if term.width == 0 || term.height == 0 {
+fn render_cover_fb(f: &mut Frame, area: Rect, img: &image::DynamicImage, app: &App, uri: &str) {
+    let Some(size) = app.pixel_size else { return };
+    let Some(pixels) = crate::pixels::cell_area(size, f.area(), area) else {
         return;
-    }
-    // Pixel size of one character cell on this console (e.g. 8x16).
-    let cell_w = fb.width / term.width as u32;
-    let cell_h = fb.height / term.height as u32;
-    if cell_w == 0 || cell_h == 0 {
-        return;
-    }
-    // Largest square (in pixels) that fits the cell rect.
-    let avail_w = area.width as u32 * cell_w;
-    let avail_h = area.height as u32 * cell_h;
-    let side = avail_w.min(avail_h);
+    };
+    let side = pixels.w.min(pixels.h);
     if side < 4 {
         return;
     }
-    let x = area.x as u32 * cell_w + (avail_w - side) / 2;
-    let y = area.y as u32 * cell_h + (avail_h - side) / 2;
-    let scaled = img
-        .resize_exact(side, side, image::imageops::FilterType::Triangle)
-        .to_rgb8();
-    *app.fb_blit.borrow_mut() = Some(crate::fb::Blit {
-        x,
-        y,
-        w: side,
-        h: side,
-        rgb: scaled.into_raw(),
-    });
+    let x = pixels.x + (pixels.w - side) / 2;
+    let y = pixels.y + (pixels.h - side) / 2;
+    let key = CoverKey {
+        uri: uri.into(),
+        width: side,
+        height: side,
+        mode: ArtMode::Fb,
+    };
+    let mut cache = app.render_cache.borrow_mut();
+    let mut blit = match cache.covers.get(&key) {
+        Some(CoverRender::Pixels(blit)) => blit,
+        _ => {
+            let scaled = img
+                .resize_exact(side, side, image::imageops::FilterType::Triangle)
+                .to_rgb8();
+            let blit = crate::fb::Blit::image(0, 0, scaled);
+            cache
+                .covers
+                .insert(key, CoverRender::Pixels(blit.clone()), blit.rgb.len());
+            blit
+        }
+    };
+    blit.x = x;
+    blit.y = y;
+    app.fb_blits.borrow_mut().push(blit);
     // Blank the cells under the image (default black bg) so the text layer is empty there.
-    let blank: Vec<Line> = (0..area.height)
-        .map(|_| Line::raw(" ".repeat(area.width as usize)))
-        .collect();
-    f.render_widget(Paragraph::new(blank), area);
+    f.render_widget(Clear, area);
 }
 
-fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage, app: &App) {
+fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage, app: &App, uri: &str) {
     use image::GenericImageView;
     if area.width < 2 || area.height < 1 {
         return;
     }
-    let mode = art_mode();
+    let mode = art_mode(app);
     if mode == ArtMode::Fb {
-        return render_cover_fb(f, area, img, app);
+        return render_cover_fb(f, area, img, app, uri);
     }
     // A cell is ~twice as tall as wide. Truecolor stacks two pixels per cell with a
     // half-block (cols = 2*rows, sample a square). The 16-colour and ASCII modes draw
@@ -1410,18 +1654,33 @@ fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage, app: &App)
     // aspect stretches back into a square on screen.
     let rows = (area.height as u32).min(area.width as u32 / 2).max(1);
     let cols = rows * 2;
+    let target = Rect {
+        x: area.x + area.width.saturating_sub(cols as u16) / 2,
+        y: area.y + area.height.saturating_sub(rows as u16) / 2,
+        width: cols as u16,
+        height: rows as u16,
+    };
+    let key = CoverKey {
+        uri: uri.into(),
+        width: cols,
+        height: rows,
+        mode,
+    };
+    let mut cache = app.render_cache.borrow_mut();
+    if let Some(CoverRender::Cells(text)) = cache.covers.get(&key) {
+        f.render_widget(Paragraph::new(text), target);
+        return;
+    }
+    let mode = &key.mode;
     let scaled = img.resize_exact(
         cols,
-        if mode == ArtMode::True {
+        if *mode == ArtMode::True {
             rows * 2
         } else {
             rows
         },
         image::imageops::FilterType::Triangle,
     );
-    let (cols_u, rows_u) = (cols as u16, rows as u16);
-    let x0 = area.x + area.width.saturating_sub(cols_u) / 2;
-    let y0 = area.y + area.height.saturating_sub(rows_u) / 2;
     let mut lines = Vec::with_capacity(rows as usize);
     for ry in 0..rows {
         let mut spans = Vec::with_capacity(cols as usize);
@@ -1458,15 +1717,13 @@ fn render_cover(f: &mut Frame, area: Rect, img: &image::DynamicImage, app: &App)
         }
         lines.push(Line::from(spans));
     }
-    f.render_widget(
-        Paragraph::new(lines),
-        Rect {
-            x: x0,
-            y: y0,
-            width: cols_u,
-            height: rows_u,
-        },
+    let text = Text::from(lines);
+    cache.covers.insert(
+        key,
+        CoverRender::Cells(text.clone()),
+        cols as usize * rows as usize * std::mem::size_of::<Span>(),
     );
+    f.render_widget(Paragraph::new(text), target);
 }
 
 /// Stats screen: room or personal listening stats from the Gleam backend.
@@ -1722,50 +1979,71 @@ fn draw_stats(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(shown).style(Style::default().fg(MAIN)), area);
 }
 
-fn draw_lyrics(f: &mut Frame, area: Rect, app: &mut App) {
-    let style = Style::default().fg(MAIN);
-    let lines: Vec<Line> = match &app.lyrics {
-        LyricsState::Idle => vec![],
-        LyricsState::Fetching(_) => vec![Line::from(vec![
-            Span::raw("Fetching lyrics from "),
-            Span::styled("lrclib", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("... "),
-        ])],
-        LyricsState::Loaded(_, l) if l.is_empty() => {
-            vec![Line::raw(""), Line::raw("Lyrics were not found.")]
-        }
-        LyricsState::Loaded(_, l) => {
-            let active = app.lyrics_active();
-            if app.lyrics_follow {
-                if let Some(a) = active {
-                    app.lyrics_offset = a.saturating_sub(area.height as usize / 2);
+fn draw_lyrics(f: &mut Frame, area: Rect, app: &App) {
+    let inner = area.inner(Margin::new(2, 1));
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let Some(current) = &app.current else {
+        f.render_widget(
+            Paragraph::new("Nothing playing. Play a song to see live lyrics.")
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(MAIN)),
+            Rect {
+                y: inner.y + inner.height / 2,
+                height: inner.height.div_ceil(2),
+                ..inner
+            },
+        );
+        return;
+    };
+    let uri = &current.track.uri;
+    // Three fixed slots, independent of text length or how many cues remain.
+    // In short windows give the current line priority over the upcoming lines.
+    let cue_h = (inner.height / 4).min(5);
+    let gap = u16::from(inner.height >= 9);
+    let height = inner.height.saturating_sub(2 * (cue_h + gap)).min(10);
+    let top = inner.y + (inner.height - height - 2 * (cue_h + gap)) / 2;
+    draw_current_lyric(
+        f,
+        Rect {
+            y: top,
+            height,
+            ..inner
+        },
+        app,
+        uri,
+        LyricRole::Current,
+    );
+
+    // Only the next two nonempty timed lines; never show a previous verse or
+    // untimed text. Before the first timestamp, preview the first two lines.
+    if cue_h > 0 {
+        if let LyricsState::Loaded(loaded_uri, lines) = &app.lyrics {
+            if loaded_uri == uri && lines.iter().any(|(ts, _)| ts.is_some()) {
+                let active = app.lyrics_active();
+                let next = lines
+                    .iter()
+                    .skip(active.map_or(0, |i| i + 1))
+                    .filter(|(ts, text)| ts.is_some() && !text.trim().is_empty())
+                    .take(2);
+                for (i, (_, text)) in next.enumerate() {
+                    draw_lyric_line(
+                        f,
+                        Rect {
+                            y: top + height + gap + i as u16 * (cue_h + gap),
+                            height: cue_h,
+                            ..inner
+                        },
+                        app,
+                        text,
+                        LyricRole::Upcoming,
+                    );
                 }
             }
-            let max_off = l.len().saturating_sub(area.height as usize);
-            app.lyrics_offset = app.lyrics_offset.min(max_off);
-            l.iter()
-                .enumerate()
-                .skip(app.lyrics_offset)
-                .take(area.height as usize)
-                .map(|(i, (_, text))| {
-                    if Some(i) == active {
-                        Line::styled(
-                            text.clone(),
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        Line::raw(text.clone())
-                    }
-                })
-                .collect()
         }
-    };
-    if app.current.is_none() {
-        return f.render_widget(Paragraph::new("").style(style), area);
     }
-    f.render_widget(Paragraph::new(lines).style(style), area);
 }
 
 // ---------- help ----------
@@ -1781,15 +2059,20 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Home", "Home"),
             ("End", "End"),
             ("", ""),
-            ("Tab", "Switch to next screen in sequence"),
-            ("Shift-Tab", "Switch to previous screen in sequence"),
+            ("Tab", "Switch between playlist and browser"),
+            ("Shift-Tab", "Switch between playlist and browser"),
             ("F1", "Show help"),
             ("1", "Show playlist"),
-            ("2", "Show browser"),
+            (
+                "2",
+                "Show now playing (cover / album artist / synced lyrics)",
+            ),
             ("3", "Show search engine"),
-            ("4", "Show media library"),
-            ("5", "Show playlist editor"),
-            ("6", "Show stats"),
+            ("4", "Show browser"),
+            ("5", "Show media library"),
+            ("6", "Show playlist editor"),
+            ("7", "Show stats"),
+            ("8", "Show help / key bindings (also F1)"),
             ("l", "Show/hide song lyrics"),
             ("[ ]", "Jump to previous / next album"),
             ("{ }", "Jump to previous / next artist"),
@@ -1805,8 +2088,8 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Backspace", "Replay current song"),
             ("f", "Seek forward in playing song"),
             ("b", "Seek backward in playing song"),
-            ("Left -", "Decrease volume by 2%"),
-            ("Right +", "Increase volume by 2%"),
+            ("Left -", "Decrease volume by 1% (unless Left navigates)"),
+            ("Right +", "Increase volume by 1% (unless Right navigates)"),
             ("", ""),
             ("v", "Reverse selection"),
             ("V", "Remove selection"),
@@ -1852,17 +2135,28 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Keys - Now playing",
+        &[
+            ("p", "Play / pause / resume"),
+            ("< >", "Previous / next track"),
+            ("l", "Show large live lyrics / return to now playing"),
+            ("`", "Refetch lyrics"),
+        ],
+    ),
+    (
         "Keys - Browser",
         &[
-            ("Enter", "Enter directory"),
+            ("Enter Right", "Enter directory"),
             ("Enter", "Add item to playlist and play it"),
             ("Space", "Add item to playlist"),
-            ("Backspace", "Jump to parent directory"),
+            ("Left Backspace", "Jump to parent directory"),
         ],
     ),
     (
         "Keys - Search engine",
         &[
+            ("3", "Reset search and return cursor to Any"),
+            ("Enter on Reset", "Clear search and return cursor to Any"),
             ("Enter", "Modify option / Run action"),
             ("Space", "Add item to playlist"),
             ("Enter", "Add item to playlist and play it"),
@@ -1895,9 +2189,18 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Keys - Stats",
+        &[
+            ("Left Right", "Change time window (7d / 30d / all)"),
+            ("Space Enter", "Toggle room / personal stats"),
+            ("u", "Refresh stats"),
+        ],
+    ),
+    (
         "Keys - Lyrics",
         &[
-            ("o", "Follow the playing song again"),
+            ("l", "Return to the previous screen"),
+            ("p", "Play / pause / resume (lyrics always follow playback)"),
             ("`", "Refetch lyrics"),
         ],
     ),

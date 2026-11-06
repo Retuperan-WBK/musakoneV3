@@ -7,6 +7,7 @@ pub struct Track {
     pub uri: String,
     pub name: String,
     pub artists: String,
+    pub album_artists: String,
     pub album: String,
     pub date: String,
     pub track_no: Option<u64>,
@@ -38,6 +39,16 @@ impl Track {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let album_artists = v
+            .pointer("/album/artists")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.get("name").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
         let date = v
             .get("date")
             .and_then(Value::as_str)
@@ -50,6 +61,7 @@ impl Track {
             uri,
             name,
             artists,
+            album_artists,
             album,
             date,
             track_no: v.get("track_no").and_then(Value::as_u64),
@@ -88,6 +100,14 @@ impl Track {
 
     pub fn duration(&self) -> String {
         self.length.map(fmt_ms).unwrap_or_default()
+    }
+
+    pub fn album_artist(&self) -> &str {
+        if self.album_artists.is_empty() {
+            &self.artists
+        } else {
+            &self.album_artists
+        }
     }
 }
 
@@ -197,6 +217,20 @@ pub struct PlaylistWithTracks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_artist_prefers_album_tags_and_falls_back_to_track_artist() {
+        let mut v = serde_json::json!({
+            "uri": "local:track:1",
+            "artists": [{"name": "Soloist"}],
+            "album": {"artists": [{"name": "Orchestra"}, {"name": "Conductor"}]}
+        });
+        let track = Track::from_value(&v).unwrap();
+        assert_eq!(track.artists, "Soloist");
+        assert_eq!(track.album_artist(), "Orchestra, Conductor");
+        v["album"] = Value::Null;
+        assert_eq!(Track::from_value(&v).unwrap().album_artist(), "Soloist");
+    }
 
     #[test]
     fn decodes_mopidy_track_and_formats() {

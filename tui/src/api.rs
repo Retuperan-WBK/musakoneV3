@@ -170,8 +170,23 @@ impl Api {
             .await
     }
 
-    /// Raw bytes of a URL (album art). Not a backend call; uses the shared client.
+    /// Mopidy-Local images are relative to our backend's /local/ proxy; remote
+    /// providers such as Tidal already return absolute image URLs.
+    fn artwork_url(&self, uri: &str) -> Result<reqwest::Url> {
+        let url = match reqwest::Url::parse(uri) {
+            Ok(url) => url,
+            Err(_) => reqwest::Url::parse(&format!("{}/", self.base.trim_end_matches('/')))?
+                .join(uri.trim_start_matches('/'))?,
+        };
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("unsupported album art URL scheme: {}", url.scheme());
+        }
+        Ok(url)
+    }
+
+    /// Fetch artwork without sending backend credentials to an image provider.
     pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let url = self.artwork_url(url)?;
         let resp = self.http.get(url).send().await?.error_for_status()?;
         Ok(resp.bytes().await?.to_vec())
     }
@@ -207,13 +222,14 @@ impl Api {
                 ))
                 .send()
                 .await?
+                .error_for_status()?
                 .json::<Value>()
                 .await?;
             s.as_array()
                 .and_then(|a| a.first().cloned())
                 .unwrap_or(Value::Null)
         } else {
-            resp.json().await?
+            resp.error_for_status()?.json().await?
         };
         let lyrics = Lyrics {
             synced: v
@@ -292,6 +308,95 @@ fn urlenc(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn image_server(
+        status: &'static str,
+        body: Vec<u8>,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 16_384);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (base, server)
+    }
+
+    #[test]
+    fn resolves_local_artwork_and_preserves_remote_urls() {
+        let api = Api::new("https://music.example/backend/".into(), None);
+        assert_eq!(
+            api.artwork_url("/local/cover.png").unwrap().as_str(),
+            "https://music.example/backend/local/cover.png"
+        );
+        assert_eq!(
+            api.artwork_url("local/cover.jpg").unwrap().as_str(),
+            "https://music.example/backend/local/cover.jpg"
+        );
+        let remote = "https://resources.tidal.com/images/cover.jpg?size=600";
+        assert_eq!(api.artwork_url(remote).unwrap().as_str(), remote);
+        assert!(api.artwork_url("file:///etc/passwd").is_err());
+        assert!(api.artwork_url("data:image/png;base64,AAAA").is_err());
+    }
+
+    #[tokio::test]
+    async fn fetches_relative_png_without_sending_backend_credentials() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        let (base, server) = image_server("200 OK", png.clone());
+        let api = Api::new(base, Some("backend-token".into()));
+        let bytes = api.fetch_bytes("/local/cover.png").await.unwrap();
+        assert_eq!(bytes, png);
+        assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 2);
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /local/cover.png HTTP/1.1\r\n"));
+        assert!(!request.to_lowercase().contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn fetches_absolute_artwork_without_using_backend_origin() {
+        let (base, server) = image_server("200 OK", b"remote image".to_vec());
+        let api = Api::new("http://127.0.0.1:1".into(), Some("backend-token".into()));
+        assert_eq!(
+            api.fetch_bytes(&format!("{base}/cover.jpg")).await.unwrap(),
+            b"remote image"
+        );
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /cover.jpg HTTP/1.1\r\n"));
+        assert!(!request.to_lowercase().contains("authorization:"));
+    }
+
+    #[tokio::test]
+    async fn reports_missing_artwork_as_an_error() {
+        let (base, server) = image_server("404 Not Found", vec![]);
+        let api = Api::new(base, None);
+        let error = api.fetch_bytes("/local/missing.png").await.unwrap_err();
+        assert!(error.to_string().contains("404"));
+        server.join().unwrap();
+    }
+
     #[test]
     fn lrc_and_urlenc() {
         assert_eq!(
