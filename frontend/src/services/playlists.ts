@@ -98,16 +98,3 @@ export async function removeTrackFromPlaylist(playlistId: number, trackUri: stri
     });
     await handleResponse(response);
 }
-
-export async function reorderPlaylistTrack(
-    playlistId: number,
-    trackUri: string,
-    newPosition: number
-): Promise<void> {
-    const response = await fetch(`${getBackendUrl()}/api/playlists/${playlistId}/tracks/reorder`, {
-        method: 'PUT',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ track_uri: trackUri, new_position: newPosition }),
-    });
-    await handleResponse(response);
-}

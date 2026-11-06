@@ -20,14 +20,9 @@ FROM oven/bun:1.3.6-alpine
 
 WORKDIR /app
 
-# Copy all source files (including TS, CSS, assets)
-COPY . .
-
-# Install dependencies (lockfile respected)
-RUN bun install --frozen-lockfile
-
-# Build frontend (outputs to /dist)
-RUN bun run build
+# Reuse the build output; the native static server needs no npm dependencies.
+COPY --from=builder /app/dist ./dist
+COPY server.ts ./server.ts
 
 # Expose port for Bun static server
 EXPOSE 3000

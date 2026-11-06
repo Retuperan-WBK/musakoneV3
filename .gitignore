@@ -128,3 +128,8 @@ mopidy-data/
 # Docker volumes
 docker-compose.override.yml# Rust
 tui/target/
+
+music/
+
+# Isolated native TUI configuration/cache for ./dev.sh
+.dev/

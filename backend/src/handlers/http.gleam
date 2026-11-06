@@ -23,6 +23,7 @@ pub type AppState {
   AppState(
     db: sqlight.Connection,
     jwt_secret: String,
+    mopidy_url: String,
     event_bus: Subject(BusMessage),
     playback_state: Subject(PlaybackStateMessage),
   )
@@ -88,7 +89,6 @@ pub fn login(state: AppState, body: String) -> Response(ResponseData) {
 
 /// Register endpoint
 pub fn register(state: AppState, body: String) -> Response(ResponseData) {
-  let _ = logging.log(logging.Debug, "Register request received: " <> body)
   case parse_login_request(body) {
     Ok(req) -> {
       let _ = case service.create_user(state.db, req.username, req.password) {

@@ -31,6 +31,17 @@ pub struct Rpc {
 }
 
 impl Rpc {
+    /// Disconnected transport for offline previews; never starts a network task.
+    pub fn offline() -> Arc<Rpc> {
+        let (out, _) = mpsc::unbounded_channel();
+        Arc::new(Rpc {
+            out,
+            pending: Default::default(),
+            next_id: AtomicU64::new(1),
+            token: Arc::new(Mutex::new(None)),
+        })
+    }
+
     pub fn start(
         ws_url: String,
         token: Option<String>,
@@ -71,9 +82,10 @@ impl Rpc {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        self.out
-            .send(Outgoing::Text(req.to_string()))
-            .map_err(|_| anyhow!("rpc task gone"))?;
+        if self.out.send(Outgoing::Text(req.to_string())).is_err() {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(anyhow!("rpc task gone"));
+        }
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) => Err(anyhow!("connection lost")),
@@ -126,7 +138,7 @@ async fn run(
             tokio::select! {
                 out = out_rx.recv() => match out {
                     Some(Outgoing::Text(t)) => {
-                        debug(&format!("-> {}", &t[..t.len().min(300)]));
+                        debug_payload("->", &t, 300);
                         if sink.send(Message::Text(t.into())).await.is_err() { break; }
                     }
                     Some(Outgoing::Reconnect) => { let _ = sink.close().await; break; }
@@ -146,8 +158,8 @@ async fn run(
 }
 
 fn dispatch(text: &str, pending: &Pending, events: &mpsc::UnboundedSender<Incoming>) {
-    debug(&format!("<- {}", &text[..text.len().min(200)]));
-    let Ok(v) = serde_json::from_str::<Value>(text) else {
+    debug_payload("<-", text, 200);
+    let Ok(mut v) = serde_json::from_str::<Value>(text) else {
         return;
     };
     if let Some(id) = v.get("id").and_then(Value::as_u64) {
@@ -159,12 +171,22 @@ fn dispatch(text: &str, pending: &Pending, events: &mpsc::UnboundedSender<Incomi
                         .and_then(Value::as_str)
                         .unwrap_or("rpc error")
                 )),
-                None => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+                None => Ok(v.get_mut("result").map(Value::take).unwrap_or(Value::Null)),
             };
             let _ = tx.send(res);
         }
     } else if v.get("event").is_some() || v.get("error").is_some() {
         let _ = events.send(Incoming::Event(v));
+    }
+}
+
+fn debug_payload(direction: &str, text: &str, limit: usize) {
+    if std::env::var_os("MUSAKONE_DEBUG").is_some() {
+        let mut end = text.len().min(limit);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        debug(&format!("{direction} {}", &text[..end]));
     }
 }
 
@@ -178,5 +200,32 @@ fn debug(line: &str) {
         {
             let _ = writeln!(f, "{line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_handles_unicode_at_the_debug_preview_boundary() {
+        let prefix = "{\"id\":7,\"result\":\"";
+        let name = format!("{}ö", "x".repeat(199 - prefix.len()));
+        let text = format!("{prefix}{name}\"}}");
+        assert!(!text.is_char_boundary(200));
+        let pending = Pending::default();
+        let (tx, mut rx) = oneshot::channel();
+        pending.lock().unwrap().insert(7, tx);
+        let (events, _) = mpsc::unbounded_channel();
+        dispatch(&text, &pending, &events);
+        assert_eq!(rx.try_recv().unwrap().unwrap(), json!(name));
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_transport_does_not_retain_pending_requests() {
+        let rpc = Rpc::offline();
+        assert!(rpc.call("core.library.browse", json!({})).await.is_err());
+        assert!(rpc.pending.lock().unwrap().is_empty());
     }
 }

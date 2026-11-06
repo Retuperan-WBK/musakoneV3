@@ -3,6 +3,8 @@
 //! of being squeezed through the 16-colour character grid. Geometry comes from sysfs,
 //! so no ioctl/libc is needed. Only active when the device is writable (user in the
 //! `video` group) and we are on the console (TERM=linux).
+use crate::pixels::PixelArea;
+use image::RgbImage;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::sync::OnceLock;
@@ -16,13 +18,92 @@ pub struct Fb {
 }
 
 /// A pending blit recorded during a draw and applied after the text layer flushes.
+#[derive(Clone)]
 pub struct Blit {
     pub x: u32,
     pub y: u32,
     pub w: u32,
     pub h: u32,
     /// RGB triples, row-major, w*h*3 bytes
-    pub rgb: Vec<u8>,
+    pub rgb: std::sync::Arc<[u8]>,
+}
+
+impl Blit {
+    pub fn image(x: u32, y: u32, image: RgbImage) -> Self {
+        Self {
+            x,
+            y,
+            w: image.width(),
+            h: image.height(),
+            rgb: image.into_raw().into(),
+        }
+    }
+
+    pub fn area(&self) -> PixelArea {
+        PixelArea {
+            x: self.x,
+            y: self.y,
+            w: self.w,
+            h: self.h,
+        }
+    }
+
+    pub fn unchanged(&self, previous: &[Blit]) -> bool {
+        previous
+            .iter()
+            .any(|old| old.area() == self.area() && std::sync::Arc::ptr_eq(&old.rgb, &self.rgb))
+    }
+
+    /// The preview applies the exact RGB bytes that the framebuffer receives.
+    pub fn paint(&self, image: &mut RgbImage) {
+        for y in 0..self.h.min(image.height().saturating_sub(self.y)) {
+            for x in 0..self.w.min(image.width().saturating_sub(self.x)) {
+                let i = (y as usize * self.w as usize + x as usize) * 3;
+                image.put_pixel(
+                    self.x + x,
+                    self.y + y,
+                    image::Rgb([self.rgb[i], self.rgb[i + 1], self.rgb[i + 2]]),
+                );
+            }
+        }
+    }
+}
+
+pub fn dimensions() -> Option<(u32, u32)> {
+    if matches!(
+        std::env::var("MUSAKONE_ASCII").as_deref(),
+        Ok("0" | "1" | "ascii")
+    ) {
+        return None;
+    }
+    get().map(|fb| (fb.width, fb.height))
+}
+
+pub fn damaged_areas(previous: &[PixelArea], next: &[Blit]) -> Vec<PixelArea> {
+    previous
+        .iter()
+        .copied()
+        .filter(|area| !next.iter().any(|b| b.area() == *area))
+        .collect()
+}
+
+pub fn damaged_rows(areas: &[PixelArea], pixels_high: u32, rows: u16) -> Vec<u16> {
+    if rows == 0 || pixels_high < rows as u32 {
+        return vec![];
+    }
+    let cell_h = pixels_high / rows as u32;
+    let mut damaged = std::collections::BTreeSet::new();
+    for area in areas {
+        let end = area
+            .y
+            .saturating_add(area.h)
+            .div_ceil(cell_h)
+            .min(rows as u32);
+        for y in (area.y / cell_h).min(end)..end {
+            damaged.insert(y as u16);
+        }
+    }
+    damaged.into_iter().collect()
 }
 
 fn read_sys(name: &str) -> Option<String> {
@@ -64,6 +145,14 @@ pub fn get() -> Option<&'static Fb> {
 }
 
 impl Fb {
+    pub fn clear(&self, area: PixelArea) {
+        let w = area.w.min(self.width.saturating_sub(area.x));
+        let h = area.h.min(self.height.saturating_sub(area.y));
+        if w > 0 && h > 0 {
+            self.blit(&Blit::image(area.x, area.y, RgbImage::new(w, h)));
+        }
+    }
+
     /// Write an RGB image at pixel (x, y), clipped to the screen.
     pub fn blit(&self, b: &Blit) {
         if b.x >= self.width || b.y >= self.height {
@@ -99,6 +188,50 @@ impl Fb {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_overlays_restore_only_the_affected_terminal_rows() {
+        let cover = PixelArea {
+            x: 80,
+            y: 48,
+            w: 320,
+            h: 320,
+        };
+        let lyric = PixelArea {
+            x: 16,
+            y: 384,
+            w: 800,
+            h: 80,
+        };
+        let keep = Blit::image(cover.x, cover.y, RgbImage::new(cover.w, cover.h));
+        assert_eq!(damaged_areas(&[cover, lyric], &[keep]), vec![lyric]);
+        assert_eq!(damaged_rows(&[lyric], 800, 50), vec![24, 25, 26, 27, 28]);
+        assert!(damaged_rows(&[lyric], 0, 50).is_empty());
+        assert_eq!(damaged_areas(&[cover], &[]), vec![cover]);
+    }
+
+    #[test]
+    fn pixel_preview_compositing_clips_at_the_surface_edge() {
+        let blit = Blit::image(1, 1, RgbImage::from_pixel(4, 4, image::Rgb([20, 40, 60])));
+        let mut surface = RgbImage::new(3, 3);
+        blit.paint(&mut surface);
+        assert_eq!(surface.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(surface.get_pixel(2, 2).0, [20, 40, 60]);
+    }
+
+    #[test]
+    fn identical_overlays_can_skip_writes_but_moves_and_new_pixels_cannot() {
+        let original = Blit::image(8, 16, RgbImage::new(20, 20));
+        let mut reused = original.clone();
+        assert!(reused.unchanged(std::slice::from_ref(&original)));
+        reused.x += 8;
+        assert!(!reused.unchanged(std::slice::from_ref(&original)));
+        let replacement = Blit::image(8, 16, RgbImage::new(20, 20));
+        assert!(!replacement.unchanged(&[original]));
+        assert!(!reused.unchanged(&[]));
+    }
+
     #[test]
     fn rgb565_packs() {
         // white -> 0xFFFF, pure red -> 0xF800

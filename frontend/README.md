@@ -18,7 +18,7 @@ Mobile-first web frontend for Mopidy music server.
 - **Wouter** (~1.5KB) - Tiny router
 - **Bun** - Fast runtime and bundler
 - **TypeScript** - Strict typing
-- **CSS Modules** - Scoped styles
+- **UnoCSS** - Utility-first styles
 
 ## Development
 
@@ -34,6 +34,9 @@ bun run build
 
 # Type check
 bun run type-check
+
+# Browse cache/navigation regression tests
+bun test test/library.test.ts
 
 # Lint & format
 bun run lint
@@ -71,7 +74,7 @@ frontend/
 │   │   ├── queue.ts      # Queue management
 │   │   └── connection.ts # WebSocket status
 │   ├── services/         # Business logic
-│   │   └── websocket.ts  # Backend WS client
+│   │   └── mopidy.ts     # Backend JSON-RPC client
 │   ├── types/            # TypeScript definitions
 │   ├── styles/           # Global CSS
 │   ├── App.tsx           # Main app component
@@ -88,15 +91,15 @@ The frontend connects to the backend WebSocket server:
 
 ```typescript
 // Send commands
-ws.send(JSON.stringify({ type: 'play' }));
-ws.send(JSON.stringify({ type: 'pause' }));
-ws.send(JSON.stringify({ type: 'next' }));
-ws.send(JSON.stringify({ type: 'set_volume', volume: 80 }));
+ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'core.playback.play', params: {} }));
+ws.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'core.playback.pause', params: {} }));
+ws.send(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'core.playback.next', params: {} }));
+ws.send(JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'core.mixer.set_volume', params: { volume: 80 } }));
 
 // Receive events (forwarded from Mopidy)
 {
   "event": "track_playback_started",
-  "data": { "tl_track": { "track": {...} } }
+  "tl_track": { "track": { "uri": "local:track:example", "name": "Example" } }
 }
 ```
 
@@ -104,7 +107,7 @@ ws.send(JSON.stringify({ type: 'set_volume', volume: 80 }));
 
 - **Touch targets**: Minimum 56px (iOS/Android guidelines)
 - **Bottom navigation**: Fixed bar for one-handed use
-- **Swipe gestures**: Ready for implementation
+- **Swipe gestures**: Queue and library track actions
 - **Large controls**: Easy to tap while moving
 - **Responsive**: Adapts to portrait/landscape
 - **PWA**: Add to home screen for app-like experience
@@ -116,7 +119,7 @@ ws.send(JSON.stringify({ type: 'set_volume', volume: 80 }));
 - **Strategy**:
   - Tree-shaking via Vite/Rollup
   - No heavy dependencies
-  - CSS Modules (no framework)
+  - UnoCSS (only used utilities)
   - Code splitting by route
   - Minimal icons (Lucide)
 
@@ -129,8 +132,8 @@ ws.send(JSON.stringify({ type: 'set_volume', volume: 80 }));
 ## Environment Variables
 
 ```env
-VITE_BACKEND_HOST=localhost  # Backend WebSocket host
-VITE_BACKEND_PORT=3001       # Backend WebSocket port
+VITE_BACKEND_URL=http://localhost:3001  # HTTP base URL; WebSocket URL is derived
+VITE_AUTH_ENABLED=true
 ```
 
 ## Contributing

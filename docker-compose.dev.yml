@@ -1,0 +1,63 @@
+# Isolated local stack. Use ./dev.sh up; no production .env is needed.
+name: musakone-dev
+
+services:
+  mopidy:
+    build:
+      context: ./mopidy
+      dockerfile: Dockerfile.dev
+    ports:
+      - "127.0.0.1:6680:6680"
+    volumes:
+      - ./music:/media/music:ro
+      - ./mopidy/mopidy.dev.conf:/config/mopidy.conf:ro
+      - mopidy-data:/var/lib/mopidy
+      - mopidy-cache:/var/cache/mopidy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:6680/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  backend:
+    build: ./backend
+    ports:
+      - "127.0.0.1:3001:3001"
+    environment:
+      JWT_SECRET: local-development-only-not-for-production
+      DB_PATH: /app/data/musakone.db
+      MOPIDY_URL: ws://mopidy:6680/mopidy/ws
+    volumes:
+      - backend-data:/app/data
+    depends_on:
+      mopidy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3001/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      VITE_BACKEND_URL: http://127.0.0.1:3001
+      VITE_AUTH_ENABLED: "true"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  mopidy-data:
+  mopidy-cache:
+  backend-data:

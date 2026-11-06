@@ -1,8 +1,10 @@
 import { useStore } from '@nanostores/preact';
 import { ChevronLeft, ChevronRight, Plus } from 'lucide-preact';
 import { useEffect, useMemo } from 'preact/hooks';
+import { LibraryList } from '../components/LibraryList';
 import { SwipeableTrackItem } from '../components/SwipeableTrackItem';
 import { useAddToQueue } from '../hooks/useAddToQueue';
+import { libraryRevision } from '../services/library-cache';
 import type { LibraryRef } from '../services/mopidy';
 import * as mopidy from '../services/mopidy';
 import {
@@ -11,12 +13,11 @@ import {
     libraryItems,
     libraryLoading,
     libraryPath,
+    loadLibrary,
     navigateBack,
     navigateTo,
     navigateToIndex,
-    setLibraryError,
-    setLibraryItems,
-    setLibraryLoading,
+    saveLibraryScroll,
 } from '../stores/library';
 import { queue } from '../stores/queue';
 import { toastError } from '../stores/toast';
@@ -28,6 +29,7 @@ export function LibraryView() {
     const loading = useStore(libraryLoading);
     const error = useStore(libraryError);
     const uri = useStore(currentUri);
+    const revision = useStore(libraryRevision);
     const queueTracks = useStore(queue);
     const { addToQueue, addNext } = useAddToQueue();
 
@@ -35,27 +37,10 @@ export function LibraryView() {
         return new Set(queueTracks.map((t) => t.track.uri));
     }, [queueTracks]);
 
-    const loadLibrary = async (browseUri: string | null) => {
-        setLibraryLoading(true);
-        setLibraryError(null);
-        // Ignore the result if the user navigated elsewhere while this request was in flight
-        const isStale = () => currentUri.get() !== browseUri;
-        try {
-            const refs = await mopidy.browse(browseUri || undefined);
-            if (isStale()) return;
-            setLibraryItems(refs);
-        } catch (err) {
-            if (isStale()) return;
-            console.error('Failed to browse library:', err);
-            setLibraryError(err instanceof Error ? err.message : 'Failed to load library');
-        } finally {
-            if (!isStale()) setLibraryLoading(false);
-        }
-    };
-
+    // biome-ignore lint/correctness/useExhaustiveDependencies: server revisions explicitly invalidate the loaded folder
     useEffect(() => {
-        loadLibrary(uri);
-    }, [uri]);
+        void loadLibrary();
+    }, [revision]);
 
     const handleItemClick = async (item: LibraryRef) => {
         if (loading) return;
@@ -109,7 +94,6 @@ export function LibraryView() {
                         type="button"
                         className="flex items-center justify-center w-8 h-8 bg-transparent border-none text-fg-secondary cursor-pointer shrink-0 transition-colors duration-150 hover:text-accent-primary disabled:opacity-50 disabled:cursor-not-allowed"
                         onClick={navigateBack}
-                        disabled={loading}
                         aria-label="Go back"
                     >
                         <ChevronLeft size={20} />
@@ -119,10 +103,10 @@ export function LibraryView() {
                     {path.map((crumb, index) => (
                         <button
                             type="button"
-                            key={index}
+                            key={crumb.uri ?? ''}
                             className={`flex items-center gap-0.5 px-1.5 py-1 bg-transparent border-none text-sm whitespace-nowrap cursor-pointer transition-colors duration-150 hover:text-accent-primary disabled:cursor-default ${index === path.length - 1 ? 'text-accent-primary' : 'text-fg-secondary'}`}
                             onClick={() => navigateToIndex(index)}
-                            disabled={loading || index === path.length - 1}
+                            disabled={index === path.length - 1}
                         >
                             {crumb.name}
                             {index < path.length - 1 && (
@@ -144,7 +128,7 @@ export function LibraryView() {
                     <button
                         type="button"
                         className="px-4 py-2 bg-bg-tertiary border-4 border-border-primary text-fg-primary font-mono text-sm cursor-pointer transition-all duration-150 uppercase hover:text-accent-primary hover:border-accent-primary"
-                        onClick={() => loadLibrary(uri)}
+                        onClick={() => loadLibrary()}
                     >
                         Retry
                     </button>
@@ -154,10 +138,12 @@ export function LibraryView() {
                     <p>No items found</p>
                 </div>
             ) : (
-                <div
-                    className={`flex-1 overflow-y-auto overscroll-y-contain pb-2 ${loading ? 'opacity-50 pointer-events-none' : ''}`}
-                >
-                    {items.map((item) =>
+                <LibraryList
+                    key={uri ?? ''}
+                    items={items}
+                    initialScroll={path.at(-1)?.scrollTop ?? 0}
+                    onScroll={saveLibraryScroll}
+                    renderItem={(item) =>
                         item.type === 'track' ? (
                             <SwipeableTrackItem
                                 key={item.uri}
@@ -213,8 +199,8 @@ export function LibraryView() {
                                 <ChevronRight size={18} className="text-fg-tertiary shrink-0" />
                             </div>
                         )
-                    )}
-                </div>
+                    }
+                />
             )}
         </div>
     );

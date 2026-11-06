@@ -50,7 +50,7 @@ services:
     restart: unless-stopped
     networks:
       - musakone
-    logs:
+    logging:
       driver: "json-file"
       options:
         max-size: "10m"

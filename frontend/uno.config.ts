@@ -57,11 +57,6 @@ export default defineConfig({
         'status-dot-connecting': 'bg-warning animate-pulse',
         'status-dot-error': 'bg-error',
 
-        // Playback flag
-        'playback-flag':
-            'bg-transparent border-none p-0 m-0 font-mono text-xs text-fg-tertiary cursor-pointer min-w-[0.6em] text-center transition-colors duration-100 hover:text-fg-primary',
-        'playback-flag-active': 'text-accent-primary',
-
         // Swipe hints
         'swipe-hint':
             'absolute top-0 bottom-0 flex items-center px-4 text-sm uppercase opacity-0 transition-opacity duration-150',
