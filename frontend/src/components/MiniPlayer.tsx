@@ -27,7 +27,6 @@ export function MiniPlayer() {
     const position = useStore(timePosition);
     const currentVolume = useStore(volume);
     const [volumeOpen, setVolumeOpen] = useState(false);
-    const localUpdateInterval = useRef<number | null>(null);
     const lastSyncTime = useRef<number>(Date.now());
     const lastSyncPosition = useRef<number>(position);
     const volumePopupRef = useRef<HTMLDivElement>(null);
@@ -35,41 +34,55 @@ export function MiniPlayer() {
 
     // Update time position while playing - derive locally, sync periodically
     useEffect(() => {
-        if (playing && track) {
+        if (!playing || !track) return;
+        let cancelled = false;
+        let syncing = false;
+        let deriving = false;
+        let revision = 0;
+        let nextSync = Date.now() + BACKEND_SYNC_INTERVAL_SECONDS * 1000;
+        lastSyncTime.current = Date.now();
+        lastSyncPosition.current = timePosition.get();
+        const unsubscribe = timePosition.listen((value) => {
+            if (deriving) return;
+            revision++;
+            lastSyncPosition.current = value;
             lastSyncTime.current = Date.now();
-            lastSyncPosition.current = position;
+        });
 
-            localUpdateInterval.current = window.setInterval(async () => {
-                const now = Date.now();
-                const elapsed = now - lastSyncTime.current;
-                const secondsSinceSync = elapsed / 1000;
-
-                if (secondsSinceSync >= BACKEND_SYNC_INTERVAL_SECONDS) {
-                    try {
-                        const pos = await mopidy.getTimePosition();
-                        updatePlaybackState({ timePosition: pos });
-                        lastSyncTime.current = now;
-                        lastSyncPosition.current = pos;
-                    } catch {
-                        const derivedPosition = lastSyncPosition.current + elapsed;
-                        updatePlaybackState({ timePosition: derivedPosition });
-                    }
-                } else {
-                    const derivedPosition = lastSyncPosition.current + elapsed;
-                    updatePlaybackState({ timePosition: derivedPosition });
+        const interval = window.setInterval(async () => {
+            if (document.hidden) return;
+            const now = Date.now();
+            const derivedPosition = lastSyncPosition.current + now - lastSyncTime.current;
+            deriving = true;
+            updatePlaybackState({
+                timePosition: Math.min(derivedPosition, track.duration || Number.POSITIVE_INFINITY),
+            });
+            deriving = false;
+            if (syncing || now < nextSync) return;
+            syncing = true;
+            const requestedRevision = revision;
+            nextSync = now + BACKEND_SYNC_INTERVAL_SECONDS * 1000;
+            try {
+                const pos = await mopidy.getTimePosition();
+                if (!cancelled && revision === requestedRevision) {
+                    updatePlaybackState({ timePosition: pos });
                 }
-            }, 100);
-        }
+            } catch {
+                // Keep the local clock; retry on the next sync interval.
+            } finally {
+                syncing = false;
+            }
+        }, 250);
 
         return () => {
-            if (localUpdateInterval.current) {
-                clearInterval(localUpdateInterval.current);
-                localUpdateInterval.current = null;
-            }
+            cancelled = true;
+            clearInterval(interval);
+            unsubscribe();
         };
     }, [playing, track]);
 
     // Close volume popup when clicking outside
+    // biome-ignore lint/correctness/useExhaustiveDependencies: volume changes restart the auto-close countdown
     useEffect(() => {
         const handleClickOutside = (event: Event) => {
             if (
@@ -231,7 +244,7 @@ export function MiniPlayer() {
 
                     <button
                         type="button"
-                        className={`btn-control ${playing ? '' : ''} bg-accent-primary text-bg-primary border-accent-primary hover:brightness-110 active:brightness-90`}
+                        className="btn-control bg-accent-primary text-bg-primary border-accent-primary hover:brightness-110 active:brightness-90"
                         onClick={handlePlayPause}
                         disabled={!track}
                         aria-label={playing ? 'Pause' : 'Play'}

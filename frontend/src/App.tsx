@@ -39,13 +39,12 @@ export const App = () => {
         };
 
         loadUser();
-    }, []);
+    }, [setLocation]);
 
     useEffect(() => {
         // Connect to backend WebSocket on mount (only if authenticated)
-        if (user) {
-            mopidy.connect().catch(console.error);
-        }
+        if (!user) return;
+        mopidy.connect().catch(console.error);
 
         return () => {
             mopidy.disconnect();

@@ -4,11 +4,12 @@
  */
 
 import { setConnectionStatus } from '../stores/connection';
-import { setPlaybackOptions, updatePlaybackState } from '../stores/player';
+import { updatePlaybackState } from '../stores/player';
 import { setQueue } from '../stores/queue';
 import type { Album, Artist, QueueTrack, Track } from '../types';
 import { getToken } from './auth';
 import { getConfigSync } from './config';
+import { invalidateBrowseCache, loadBrowse } from './library-cache';
 
 interface JsonRpcRequest {
     jsonrpc: '2.0';
@@ -87,6 +88,7 @@ class MopidyWebSocket {
     private intentionalClose = false;
     /** Guards against out-of-order tracklist refreshes */
     private tracklistSeq = 0;
+    private hasConnected = false;
 
     constructor(url?: string) {
         this.urlOverride = url;
@@ -145,6 +147,8 @@ class MopidyWebSocket {
             ws.onopen = () => {
                 console.log('Backend WebSocket connected');
                 this.connected = true;
+                if (this.hasConnected) invalidateBrowseCache();
+                this.hasConnected = true;
                 this.reconnectDelay = 1000;
                 this.connectionPromise = null;
                 setConnectionStatus('connected');
@@ -179,6 +183,7 @@ class MopidyWebSocket {
                 this.connectionPromise = null;
                 setConnectionStatus('disconnected');
                 this.rejectAllPending();
+                invalidateBrowseCache(false);
                 this.scheduleReconnect();
             };
         });
@@ -231,9 +236,11 @@ class MopidyWebSocket {
     }
 
     private handleEvent(event: MopidyEvent): void {
-        console.log('Mopidy event:', event.event, event);
-
         switch (event.event) {
+            case 'library_changed':
+            case 'mopidy_connected':
+                invalidateBrowseCache();
+                break;
             case 'track_playback_started':
                 if (event.tl_track) {
                     const tlTrack = event.tl_track as MopidyTlTrack;
@@ -282,10 +289,6 @@ class MopidyWebSocket {
                 break;
             }
 
-            case 'options_changed':
-                this.getPlaybackOptions().then(setPlaybackOptions).catch(console.error);
-                break;
-
             case 'volume_changed':
                 if (event.volume !== undefined) {
                     updatePlaybackState({ volume: event.volume as number });
@@ -297,9 +300,6 @@ class MopidyWebSocket {
                     updatePlaybackState({ timePosition: event.time_position as number });
                 }
                 break;
-
-            default:
-                console.log('Unhandled event:', event.event);
         }
     }
 
@@ -322,7 +322,6 @@ class MopidyWebSocket {
 
             this.tracklistSeq++;
             setQueue(tracklist.map(convertTlTrack));
-            this.getPlaybackOptions().then(setPlaybackOptions).catch(console.error);
         } catch (err) {
             console.error('Failed to load initial state:', err);
         }
@@ -370,6 +369,7 @@ class MopidyWebSocket {
 
     disconnect(): void {
         this.intentionalClose = true;
+        invalidateBrowseCache(false);
         if (this.reconnectTimeout) {
             clearTimeout(this.reconnectTimeout);
             this.reconnectTimeout = null;
@@ -402,10 +402,6 @@ class MopidyWebSocket {
         await this.rpc('core.playback.resume');
     }
 
-    async stop(): Promise<void> {
-        await this.rpc('core.playback.stop');
-    }
-
     async next(): Promise<void> {
         await this.rpc('core.playback.next');
     }
@@ -418,24 +414,11 @@ class MopidyWebSocket {
         return this.rpc<boolean>('core.playback.seek', { time_position: timePosition });
     }
 
-    async getState(): Promise<'playing' | 'paused' | 'stopped'> {
-        return this.rpc<'playing' | 'paused' | 'stopped'>('core.playback.get_state');
-    }
-
-    async getCurrentTrack(): Promise<Track | null> {
-        const tlTrack = await this.rpc<MopidyTlTrack | null>('core.playback.get_current_tl_track');
-        return tlTrack ? convertTrack(tlTrack.track) : null;
-    }
-
     async getTimePosition(): Promise<number> {
         return (await this.rpc<number>('core.playback.get_time_position')) || 0;
     }
 
     // Volume control
-    async getVolume(): Promise<number> {
-        return (await this.rpc<number>('core.mixer.get_volume')) || 0;
-    }
-
     async setVolume(volume: number): Promise<boolean> {
         return this.rpc<boolean>('core.mixer.set_volume', {
             volume: Math.max(0, Math.min(100, volume)),
@@ -480,12 +463,14 @@ class MopidyWebSocket {
 
     // Library browsing
     async browse(uri?: string): Promise<LibraryRef[]> {
-        const refs = await this.rpc<MopidyRef[]>('core.library.browse', { uri: uri || null });
-        return refs.map((ref) => ({
-            type: ref.type as LibraryRef['type'],
-            uri: ref.uri,
-            name: ref.name,
-        }));
+        return loadBrowse(uri ?? null, async () => {
+            const refs = await this.rpc<MopidyRef[]>('core.library.browse', { uri: uri || null });
+            return refs.map((ref) => ({
+                type: ref.type as LibraryRef['type'],
+                uri: ref.uri,
+                name: ref.name,
+            }));
+        });
     }
 
     async lookup(uris: string[]): Promise<Map<string, Track[]>> {
@@ -540,60 +525,6 @@ class MopidyWebSocket {
 
         return { tracks, artists, albums };
     }
-
-    // Get full playback state
-    async getFullState(): Promise<FullPlaybackState> {
-        const [state, currentTlTrack, timePosition, volume, repeat, single, random, consume] =
-            await Promise.all([
-                this.getState(),
-                this.rpc<MopidyTlTrack | null>('core.playback.get_current_tl_track'),
-                this.getTimePosition(),
-                this.getVolume(),
-                this.rpc<boolean>('core.tracklist.get_repeat'),
-                this.rpc<boolean>('core.tracklist.get_single'),
-                this.rpc<boolean>('core.tracklist.get_random'),
-                this.rpc<boolean>('core.tracklist.get_consume'),
-            ]);
-
-        return {
-            state,
-            currentTrack: currentTlTrack ? convertTrack(currentTlTrack.track) : null,
-            currentTlid: currentTlTrack?.tlid ?? null,
-            timePosition,
-            volume,
-            repeat,
-            single,
-            random,
-            consume,
-        };
-    }
-
-    // Playback options
-    async getPlaybackOptions(): Promise<PlaybackOptions> {
-        const [repeat, random, single, consume] = await Promise.all([
-            this.rpc<boolean>('core.tracklist.get_repeat'),
-            this.rpc<boolean>('core.tracklist.get_random'),
-            this.rpc<boolean>('core.tracklist.get_single'),
-            this.rpc<boolean>('core.tracklist.get_consume'),
-        ]);
-        return { repeat, random, single, consume };
-    }
-
-    async setRepeat(value: boolean): Promise<void> {
-        await this.rpc('core.tracklist.set_repeat', { value });
-    }
-
-    async setRandom(value: boolean): Promise<void> {
-        await this.rpc('core.tracklist.set_random', { value });
-    }
-
-    async setSingle(value: boolean): Promise<void> {
-        await this.rpc('core.tracklist.set_single', { value });
-    }
-
-    async setConsume(value: boolean): Promise<void> {
-        await this.rpc('core.tracklist.set_consume', { value });
-    }
 }
 
 // Helper functions
@@ -633,25 +564,6 @@ export interface SearchResult {
     albums: Album[];
 }
 
-export interface FullPlaybackState {
-    state: 'playing' | 'paused' | 'stopped';
-    currentTrack: Track | null;
-    currentTlid: number | null;
-    timePosition: number;
-    volume: number;
-    repeat: boolean;
-    single: boolean;
-    random: boolean;
-    consume: boolean;
-}
-
-export interface PlaybackOptions {
-    repeat: boolean;
-    random: boolean;
-    single: boolean;
-    consume: boolean;
-}
-
 // Singleton instance
 const mopidyClient = new MopidyWebSocket();
 
@@ -661,14 +573,10 @@ export const disconnect = () => mopidyClient.disconnect();
 export const play = (tlid?: number) => mopidyClient.play(tlid);
 export const pause = () => mopidyClient.pause();
 export const resume = () => mopidyClient.resume();
-export const stop = () => mopidyClient.stop();
 export const next = () => mopidyClient.next();
 export const previous = () => mopidyClient.previous();
 export const seek = (pos: number) => mopidyClient.seek(pos);
-export const getState = () => mopidyClient.getState();
-export const getCurrentTrack = () => mopidyClient.getCurrentTrack();
 export const getTimePosition = () => mopidyClient.getTimePosition();
-export const getVolume = () => mopidyClient.getVolume();
 export const setVolume = (vol: number) => mopidyClient.setVolume(vol);
 export const getTracklist = () => mopidyClient.getTracklist();
 export const addToTracklist = (uris: string[], pos?: number) =>
@@ -682,11 +590,3 @@ export const getCurrentTlid = () => mopidyClient.getCurrentTlid();
 export const browse = (uri?: string) => mopidyClient.browse(uri);
 export const lookup = (uris: string[]) => mopidyClient.lookup(uris);
 export const search = (query: string) => mopidyClient.search(query);
-export const getFullState = () => mopidyClient.getFullState();
-export const getPlaybackOptions = () => mopidyClient.getPlaybackOptions();
-export const setRepeat = (value: boolean) => mopidyClient.setRepeat(value);
-export const setRandom = (value: boolean) => mopidyClient.setRandom(value);
-export const setSingle = (value: boolean) => mopidyClient.setSingle(value);
-export const setConsume = (value: boolean) => mopidyClient.setConsume(value);
-
-export default mopidyClient;
