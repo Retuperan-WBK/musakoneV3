@@ -13,6 +13,7 @@ import gleam/option
 import gleam/result
 import gleam/string
 import gleam/uri
+import handlers/artwork
 import handlers/http as http_handlers
 import handlers/stats as stats_handlers
 import logging
@@ -80,6 +81,7 @@ pub fn main() {
     http_handlers.AppState(
       db: db,
       jwt_secret: jwt_secret,
+      mopidy_url: mopidy_url,
       event_bus: bus,
       playback_state: ps_actor,
     )
@@ -524,6 +526,11 @@ fn handle_request(
         Error(_) -> error_response("Invalid playlist ID", 400) |> with_cors
       }
     }
+
+    // Mopidy-Local returns /local/<image> URLs; keep its HTTP port private.
+    http.Get, ["local", filename] ->
+      artwork.get(state.mopidy_url, filename)
+      |> with_cors
 
     // WebSocket endpoint - now uses event bus
     http.Get, ["ws"] -> {

@@ -136,6 +136,13 @@ default 30) and `tz` (browser offset in minutes east of UTC).
 
 ## WebSocket
 
+### `GET /local/:filename`
+
+Public PNG/JPEG album-cover proxy for Mopidy-Local image URLs. Fetches only a safe
+image filename from the HTTP(S) origin configured by `MOPIDY_URL` (converting
+`ws`/`wss` to `http`/`https`). Music files, arbitrary URLs and redirects are not
+proxied. Clients do not need direct access to Mopidy's HTTP port.
+
 ### `WS /ws`
 Real-time connection for Mopidy communication.
 
