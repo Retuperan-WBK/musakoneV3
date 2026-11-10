@@ -391,6 +391,8 @@ pub struct App {
 
 const VOL_STEP: i64 = 1; // ncmpcpp volume_change_step = 1
 const HIGHLIGHT_DELAY: Duration = Duration::from_secs(5);
+/// Synced lyric lines light up this much before their timestamp.
+const LYRICS_LEAD_MS: u64 = 100;
 
 impl App {
     pub fn new(
@@ -1393,7 +1395,7 @@ impl App {
         if self.current.as_ref()?.track.uri != *uri {
             return None;
         }
-        let now = self.elapsed_ms();
+        let now = self.elapsed_ms() + LYRICS_LEAD_MS;
         let mut active = None;
         for (i, (ts, _)) in lines.iter().enumerate() {
             match ts {
